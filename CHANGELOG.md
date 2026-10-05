@@ -1,3 +1,18 @@
+# Unreleased
+
+- Add `instantiate_type_alias`, an explicit instantiation helper for stored
+  (possibly generic, possibly recursive) `TypeAliasType` values. It binds
+  explicit type arguments first and declared type-parameter defaults next,
+  then substitutes them through unions (both `typing.Union[...]` and PEP 604
+  `X | Y`), typing and PEP 585 generics, `Callable`/`Concatenate`/`Unpack` and
+  `Annotated` (metadata order and contents are preserved). Recursive aliases
+  are not infinitely expanded: bare self-references become identity
+  back-edges and applied self-references become finite `TypeAliasReference`
+  nodes. String `ForwardRef`s are resolved only through the provided `names`
+  mapping (never via `eval`, and lazy bare-string expressions are not forced
+  to evaluate); unprovided names are returned as locatable `PendingType`
+  items. The result is exposed as the frozen `InstantiatedTypeAlias` type.
+
 # Release 4.16.0 (July 2, 2025)
 
 No user-facing changes since 4.16.0rc2.

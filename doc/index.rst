@@ -562,6 +562,47 @@ Special typing primitives
 
    .. versionadded:: 4.6.0
 
+.. function:: instantiate_type_alias(alias, *type_args, names=None)
+
+   Explicitly instantiate a stored, possibly generic
+   :class:`TypeAliasType` with the given positional type arguments and return
+   an :class:`InstantiatedTypeAlias` whose ``__value__`` is the substituted
+   alias value.
+
+   Explicit arguments are bound first; remaining type parameters take their
+   declared ``__default__`` (defaults may reference earlier parameters). The
+   substitution rebuilds ``typing.Union`` and PEP 604 ``X | Y`` unions,
+   PEP 585 and ``typing`` generics, ``Callable``/``Concatenate``/``Unpack``
+   forms and :data:`Annotated`, preserving ``Annotated`` metadata order.
+
+   Recursive aliases are never infinitely expanded: a bare self-reference
+   becomes an identity back-edge and an applied self-reference becomes a
+   finite :class:`TypeAliasReference` node. String
+   :class:`~typing.ForwardRef` nodes are resolved only through *names*; they
+   are never passed to ``eval`` and lazy bare-string expressions are not
+   forced to evaluate. Names missing from *names* become locatable
+   :class:`PendingType` items collected in ``result.__pending__``.
+
+.. class:: InstantiatedTypeAlias
+
+   The frozen result of :func:`instantiate_type_alias`. Exposes ``__name__``,
+   ``__value__``, ``__type_params__``, ``__type_args__``, ``__parameters__``
+   and ``__pending__`` (a tuple of :class:`PendingType` nodes).
+
+.. class:: TypeAliasReference
+
+   A finite node representing an applied type alias (``alias[args]``) inside
+   an instantiated value, used for recursive back-edges and for applications
+   of aliases resolved through *names*. Exposes ``__alias__``, ``__args__``
+   and ``__name__``.
+
+.. class:: PendingType
+
+   A locatable marker for a string forward reference that could not be found
+   in *names*. Exposes ``__pending_name__``, ``__forward_ref__`` (the
+   original, unevaluated :class:`~typing.ForwardRef`), ``locate()`` (a tuple
+   path into the instantiated value) and ``format_location(root_name)``.
+
 .. data:: TypeForm
 
    See :pep:`747`. A special form representing the value of a type expression.

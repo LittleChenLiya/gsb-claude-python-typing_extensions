@@ -83,6 +83,8 @@ __all__ = [
     'get_original_bases',
     'get_protocol_members',
     'get_type_hints',
+    'instantiate_type_alias',
+    'InstantiatedTypeAlias',
     'IntVar',
     'is_protocol',
     'is_typeddict',
@@ -99,6 +101,8 @@ __all__ = [
     'Text',
     'TypeAlias',
     'TypeAliasType',
+    'TypeAliasReference',
+    'PendingType',
     'TypeForm',
     'TypeGuard',
     'TypeIs',
@@ -3931,6 +3935,482 @@ else:
                 if not _is_unionable(left):
                     return NotImplemented
                 return typing.Union[left, self]
+
+
+_UNBOUND_SENTINEL = object()
+
+
+class PendingType:
+    """A lazily referenced type that could not be resolved.
+
+    A marker recorded in an :class:`InstantiatedTypeAlias` value wherever a
+    string :class:`~typing.ForwardRef` (or a bare lazily stored name) cannot
+    be found in the *names* table passed to :func:`instantiate_type_alias`.
+
+    Pending references are **never** evaluated: the original name is kept
+    verbatim (exposed as :attr:`__pending_name__`) and a locatable record
+    (:meth:`locate`, :meth:`format_location`, collected in
+    :attr:`InstantiatedTypeAlias.__pending__`) is returned instead of raising
+    or calling :func:`eval`. The original unevaluated :class:`ForwardRef` is
+    retained as :attr:`__forward_ref__`.
+
+    Attributes:
+        __pending_name__: The name that failed to resolve.
+        __pending_path__: A tuple describing where the reference sits inside
+            the instantiated alias value. Each ``int`` element indexes into the
+            argument tuple of the generic/union at that level; the string
+            ``"metadata"`` followed by an ``int`` indexes into the metadata of
+            an :data:`~typing.Annotated` node. An empty tuple means the alias
+            value itself is pending.
+    """
+
+    __slots__ = (
+        '__pending_name__', '__pending_path__', '__forward_ref__',
+    )
+
+    def __init__(self, forward_ref, name, path):
+        object.__setattr__(self, '__pending_name__', name)
+        object.__setattr__(self, '__pending_path__', tuple(path))
+        object.__setattr__(self, '__forward_ref__', forward_ref)
+
+    @property
+    def __forward_arg__(self):
+        """The unresolved name, matching ``ForwardRef.__forward_arg__``."""
+        return object.__getattribute__(self, '__pending_name__')
+
+    def locate(self):
+        """Return the location tuple of the pending reference."""
+        return object.__getattribute__(self, '__pending_path__')
+
+    def format_location(self, root_name='<alias>'):
+        """Render :meth:`locate` as a human-readable traversal path."""
+        rendered = root_name + '.__value__'
+        path = self.locate()
+        i = 0
+        while i < len(path):
+            element = path[i]
+            if element == 'metadata':
+                rendered += f'.__metadata__[{path[i + 1]}]'
+                i += 2
+            else:
+                rendered += f'[{element}]'
+                i += 1
+        return rendered
+
+    def __repr__(self):
+        return f"PendingType({self.__pending_name__!r})"
+
+    def __call__(self, *args, **kwargs):
+        raise TypeError("Pending type alias reference is not callable")
+
+    def __or__(self, other):
+        return typing.Union[self, other]
+
+    def __ror__(self, other):
+        return typing.Union[other, self]
+
+    # Identity semantics: repeated unresolved references are never collapsed
+    # by Union flattening/deduplication, so each keeps its own location.
+    __hash__ = object.__hash__
+
+    def __eq__(self, other):
+        return self is other
+
+    def __ne__(self, other):
+        return self is not other
+
+
+class TypeAliasReference:
+    """A finite node standing for an *applied* (subscripted) type alias.
+
+    ``TypeAliasReference`` represents ``alias[args]`` inside the value of an
+    :class:`InstantiatedTypeAlias` without expanding ``alias.__value__``. It is
+    used both for back-edges (applications of the alias being instantiated,
+    i.e. recursive aliases) and for applications of other aliases resolved
+    through the *names* table, which keeps recursive and mutually recursive
+    structures finite.
+
+    Attributes:
+        __alias__: The (unexpanded) alias the reference points at.
+        __args__: The substituted arguments of the application.
+        __name__: A display name taken from the referenced alias.
+    """
+
+    __slots__ = ('__alias__', '__args__', '__name__')
+
+    def __init__(self, alias, args=(), *, name=None):
+        object.__setattr__(self, '__alias__', alias)
+        object.__setattr__(self, '__args__', tuple(args))
+        object.__setattr__(
+            self, '__name__',
+            name if name is not None else getattr(alias, '__name__', alias),
+        )
+
+    def __repr__(self):
+        if self.__args__:
+            return '{}[{}]'.format(
+                self.__name__, ', '.join(repr(arg) for arg in self.__args__)
+            )
+        return str(self.__name__)
+
+    def __call__(self, *args, **kwargs):
+        raise TypeError("Type alias reference is not callable")
+
+
+class _InstantiatedTypeAlias:
+    """The result of :func:`instantiate_type_alias`.
+
+    Mirrors the relevant attributes of :class:`TypeAliasType` and additionally
+    records the explicit type arguments and any :class:`PendingType` nodes.
+
+    Attributes:
+        __name__: A display name, including the applied arguments.
+        __value__: The substituted alias value.
+        __type_params__: The declared type parameters of the original alias.
+        __type_args__: The arguments the alias was instantiated with.
+        __parameters__: Type variables still free in ``__value__``.
+        __pending__: Tuple of :class:`PendingType` nodes in ``__value__``.
+    """
+
+    # '__module__' is intentionally left out of __slots__: the class itself
+    # already carries a ``__module__`` class attribute.
+    __slots__ = (
+        '__name__', '__value__', '__type_params__', '__type_args__',
+        '__parameters__', '__pending__',
+    )
+
+    def __init__(self, name, value, type_params, type_args, parameters,
+                 pending):
+        object.__setattr__(self, '__name__', name)
+        object.__setattr__(self, '__value__', value)
+        object.__setattr__(self, '__type_params__', tuple(type_params))
+        object.__setattr__(self, '__type_args__', tuple(type_args))
+        object.__setattr__(self, '__parameters__', tuple(parameters))
+        object.__setattr__(self, '__pending__', tuple(pending))
+
+    def __setattr__(self, name, value):
+        raise AttributeError(
+            f"attribute '{name}' of 'InstantiatedTypeAlias' objects "
+            "is not writable"
+        )
+
+    def __delattr__(self, name):
+        raise AttributeError(
+            f"attribute '{name}' of 'InstantiatedTypeAlias' objects "
+            "is not writable"
+        )
+
+    def __repr__(self):
+        return self.__name__
+
+    def __reduce__(self):
+        return self.__name__
+
+    def __call__(self, *args, **kwargs):
+        raise TypeError("Instantiated type alias is not callable")
+
+
+# Public user-facing alias for the private result class.
+InstantiatedTypeAlias = _InstantiatedTypeAlias
+
+
+# The alias-like types accepted by instantiate_type_alias: the
+# typing_extensions backport, (on 3.12-3.14) the stdlib TypeAliasType, and
+# our own result type.
+_ALIAS_LIKE_TYPES = (_InstantiatedTypeAlias,)
+if hasattr(typing, 'TypeAliasType'):
+    _ALIAS_LIKE_TYPES = (TypeAliasType, typing.TypeAliasType,
+                         _InstantiatedTypeAlias)
+
+
+def _is_alias_like(obj):
+    return isinstance(obj, _ALIAS_LIKE_TYPES)
+
+
+def _lookup_pending_name(names, name):
+    if names is None:
+        return False, None
+    try:
+        return True, names[name]
+    except KeyError:
+        return False, None
+    except TypeError:
+        return False, None
+
+
+def _build_union(args):
+    """Rebuild a union, preserving X-union versus typing.Union flavor where
+    possible and flattening nested unions."""
+    try:
+        return functools.reduce(operator.or_, args)
+    except TypeError:
+        return typing.Union[tuple(args)]
+
+
+def _replace_pending_with_forward_refs(arguments):
+    """Return *arguments* with :class:`PendingType` nodes replaced by their
+    original, still-unevaluated :class:`ForwardRef`.
+
+    Some runtime constructors (``typing.Union[...]``, ``typing.List[...]``)
+    reject arbitrary objects via ``typing._type_check``; the unevaluated
+    forward references are accepted by them, while the locatable
+    ``PendingType`` nodes remain available in
+    :attr:`InstantiatedTypeAlias.__pending__`.
+    """
+    def convert(arg):
+        if isinstance(arg, PendingType):
+            return object.__getattribute__(arg, '__forward_ref__')
+        return arg
+    return tuple(convert(arg) for arg in arguments)
+
+
+def _safe_typing_copy_with(node, new_args):
+    """Rebuild a ``typing._GenericAlias`` with *new_args*, falling back to the
+    original unevaluated forward references if a pending node is rejected."""
+    payload = new_args[0] if len(new_args) == 1 else new_args
+    try:
+        return node.copy_with(payload)
+    except TypeError:
+        converted = _replace_pending_with_forward_refs(new_args)
+        payload = converted[0] if len(converted) == 1 else converted
+        return node.copy_with(payload)
+
+
+def _instantiate_alias_substitute(
+    node, path, *, root, result, binding, names, pending
+):
+    # Recursive references must stop here: a bare occurrence of the root
+    # alias becomes a direct identity back-edge ...
+    if node is root or node is result:
+        return result
+
+    # Bound type parameters (explicit values win, then declared defaults).
+    try:
+        bound = binding.get(node, _UNBOUND_SENTINEL)
+    except TypeError:
+        bound = _UNBOUND_SENTINEL
+    if bound is not _UNBOUND_SENTINEL:
+        return _instantiate_alias_substitute(
+            bound, path, root=root, result=result, binding=binding,
+            names=names, pending=pending,
+        )
+
+    # String ForwardRefs are resolved *only* through the provided name table.
+    # They are never eval()'d and lazy expressions are never forced.
+    if isinstance(node, typing.ForwardRef):
+        name = node.__forward_arg__
+        found, resolved = _lookup_pending_name(names, name)
+        if not found:
+            pending_node = PendingType(node, name, path)
+            pending.append(pending_node)
+            return pending_node
+        return _instantiate_alias_substitute(
+            resolved, path, root=root, result=result, binding=binding,
+            names=names, pending=pending,
+        )
+
+    # A bare string stored as the value is a lazy expression: keep it
+    # verbatim, do not evaluate it.
+    if isinstance(node, str):
+        return node
+
+    # Callable parameter lists are nested inside __args__ as a plain list;
+    # substitute through them, preserving the list container.
+    if isinstance(node, list):
+        return [
+            _instantiate_alias_substitute(
+                item, path + (i,), root=root, result=result, binding=binding,
+                names=names, pending=pending,
+            )
+            for i, item in enumerate(node)
+        ]
+
+    # Annotated: substitute the type and every metadata entry, keeping the
+    # metadata order exactly as stored.
+    metadata = getattr(node, '__metadata__', None)
+    if metadata is not None:
+        new_origin = _instantiate_alias_substitute(
+            node.__origin__, path, root=root, result=result, binding=binding,
+            names=names, pending=pending,
+        )
+        new_metadata = tuple(
+            _instantiate_alias_substitute(
+                item, path + ('metadata', i), root=root, result=result,
+                binding=binding, names=names, pending=pending,
+            )
+            for i, item in enumerate(metadata)
+        )
+        return Annotated[(new_origin,) + new_metadata]
+
+    # X-style unions (int | str) and typing.Union[...] share get_origin
+    # semantics but use different runtime objects.
+    origin = get_origin(node)
+    if origin is typing.Union or (
+        hasattr(_types, 'UnionType') and origin is _types.UnionType
+    ):
+        new_args = tuple(
+            _instantiate_alias_substitute(
+                arg, path + (i,), root=root, result=result, binding=binding,
+                names=names, pending=pending,
+            )
+            for i, arg in enumerate(node.__args__)
+        )
+        return _build_union(new_args)
+
+    args = getattr(node, '__args__', ())
+    if args or origin is not None:
+        new_args = tuple(
+            _instantiate_alias_substitute(
+                arg, path + (i,), root=root, result=result, binding=binding,
+                names=names, pending=pending,
+            )
+            for i, arg in enumerate(args)
+        )
+        # An application of the alias being instantiated (the recursive
+        # back-edge) or of another type alias becomes a finite
+        # TypeAliasReference node instead of being expanded.
+        if origin is root or origin is result:
+            return TypeAliasReference(result, new_args, name=root.__name__)
+        if _is_alias_like(origin):
+            return TypeAliasReference(origin, new_args, name=origin.__name__)
+        # typing generics (List[...], Callable[...], Unpack[...], etc.) carry
+        # their own reconstruction logic (normalization, Callable lists, ...).
+        if isinstance(node, typing._GenericAlias):
+            return _safe_typing_copy_with(node, new_args)
+        # PEP 585 built-in generics (list[...], dict[...], ...).
+        if isinstance(node, _types.GenericAlias):
+            return type(node)(origin, new_args)
+        return node
+
+    # A bare occurrence of another alias is kept nominal (and finite).
+    return node
+
+
+def _collect_free_parameters(value, root):
+    """Collect type parameters still free in *value*, cycle-safe so that
+    recursive back-edges never cause infinite traversal."""
+    free = []
+    seen = set()
+
+    def walk(node):
+        identity = id(node)
+        if identity in seen:
+            return
+        seen.add(identity)
+        # Do not look through aliases or reference nodes.
+        if node is root or _is_alias_like(node) or isinstance(
+            node, TypeAliasReference
+        ):
+            return
+        for parameter in getattr(node, '__parameters__', ()):
+            if parameter not in free:
+                free.append(parameter)
+        for argument in getattr(node, '__args__', ()):
+            walk(argument)
+        for metadata in getattr(node, '__metadata__', ()):
+            walk(metadata)
+
+    walk(value)
+    return tuple(free)
+
+
+def instantiate_type_alias(alias, *type_args, names=None):
+    """Explicitly instantiate a stored, possibly generic :class:`TypeAliasType`.
+
+    ``instantiate_type_alias(Alias, int)`` returns an
+    :class:`InstantiatedTypeAlias` whose ``__value__`` is ``Alias.__value__``
+    with the declared type parameters replaced by the given arguments.
+
+    For example, given::
+
+        type Alias[T] = list[Annotated[T, "x"]]
+
+    ``instantiate_type_alias(Alias, int)`` yields the value
+    ``list[Annotated[int, "x"]]``.
+
+    Binding rules:
+        * Explicit positional arguments are bound first, in order.
+        * Remaining type parameters take their declared ``__default__``;
+          defaults may refer to earlier parameters.
+        * It is an error to supply too many arguments or to omit an argument
+          for a parameter without a default.
+
+    Substitution rules:
+        * Unions (both ``Union[...]`` and ``X | Y``), typing and PEP 585
+          generics, ``Callable``/``Concatenate``/``Unpack`` forms and
+          :data:`~typing.Annotated` are rebuilt with substituted arguments.
+        * ``Annotated`` metadata order and contents are preserved; plain
+          metadata strings are never treated as names.
+        * Recursive aliases are not infinitely expanded: a bare application
+          target becomes an identity back-edge, and applied occurrences become
+          finite :class:`TypeAliasReference` nodes.
+        * String :class:`~typing.ForwardRef` nodes are looked up in the
+          optional *names* mapping only. They are never passed to ``eval`` and
+          lazy (bare string) expressions are never forced; unresolved names
+          become locatable :class:`PendingType` nodes collected in
+          ``result.__pending__``.
+
+    Support scope: ``TypeVar`` parameters are fully supported, including
+    defaults. ``TypeVarTuple`` and ``ParamSpec`` parameters are bound and
+    substituted as whole values (no positional splatting or parameter-list
+    decomposition). The function accepts both the ``typing`` and
+    ``typing_extensions`` flavours of :class:`TypeAliasType` on all versions
+    supported by ``typing_extensions``.
+    """
+    if not _is_alias_like(alias):
+        raise TypeError(
+            f"Expected a TypeAliasType, got {alias!r}"
+        )
+    type_params = tuple(getattr(alias, '__type_params__', ()))
+    explicit = list(type_args)
+    if len(explicit) > len(type_params):
+        raise TypeError(
+            f"Too many arguments for {alias.__name__}: expected at most "
+            f"{len(type_params)}, got {len(explicit)}"
+        )
+
+    binding = {}
+    for parameter, argument in zip(type_params, explicit):
+        binding[parameter] = argument
+    for parameter in type_params[len(explicit):]:
+        default = getattr(parameter, '__default__', NoDefault)
+        if default is NoDefault:
+            raise TypeError(
+                f"No argument supplied for type parameter {parameter!r} "
+                f"of {alias.__name__}, which has no default"
+            )
+        binding[parameter] = default
+
+    argument_names = []
+    for argument in type_args:
+        argument_names.append(
+            type_repr(argument)
+        )
+    display_name = (
+        alias.__name__
+        if not argument_names
+        else f"{alias.__name__}[{', '.join(argument_names)}]"
+    )
+
+    # Create the result shell first, so a recursive reference can close the
+    # cycle while substituting the value (finite back-edge, no expansion).
+    # __init__ stores a placeholder value; it is replaced below through
+    # object.__setattr__ once substitution has completed.
+    result = _InstantiatedTypeAlias(
+        display_name, None, type_params, explicit, (), (),
+    )
+
+    pending = []
+    value = _instantiate_alias_substitute(
+        getattr(alias, '__value__', None), (), root=alias, result=result,
+        binding=binding, names=names, pending=pending,
+    )
+    object.__setattr__(result, '__value__', value)
+    object.__setattr__(
+        result, '__parameters__', _collect_free_parameters(value, result)
+    )
+    object.__setattr__(result, '__pending__', tuple(pending))
+    return result
 
 
 if hasattr(typing, "is_protocol"):
