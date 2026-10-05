@@ -30,6 +30,7 @@ import typing_extensions
 from _typed_dict_test_helper import Foo, FooGeneric, VeryAnnotated
 from typing_extensions import (
     _FORWARD_REF_HAS_CLASS,
+    AliasReference,
     Annotated,
     Any,
     AnyStr,
@@ -62,6 +63,7 @@ from typing_extensions import (
     ParamSpec,
     ParamSpecArgs,
     ParamSpecKwargs,
+    PendingType,
     Protocol,
     ReadOnly,
     Required,
@@ -95,6 +97,7 @@ from typing_extensions import (
     get_overloads,
     get_protocol_members,
     get_type_hints,
+    instantiate_alias,
     is_protocol,
     is_typeddict,
     no_type_check,
@@ -8680,6 +8683,256 @@ class TypeAliasTypeTests(BaseTestCase):
             with self.subTest(type_params=case):
                 with self.assertRaisesRegex(TypeError, msg):
                     TypeAliasType("InvalidCase", List[T], type_params=case)
+
+
+class TypeAliasInstantiationTests(BaseTestCase):
+    """Tests for explicit instantiation of TypeAliasType."""
+
+    def test_basic_substitution(self):
+        T = TypeVar("T")
+        Alias = TypeAliasType(
+            "Alias", list[Annotated[T, "x"]], type_params=(T,)
+        )
+        value, pending = instantiate_alias(Alias, int)
+        self.assertEqual(value, list[Annotated[int, "x"]])
+        self.assertEqual(pending, [])
+        # Metadata order is preserved
+        annotated = value.__args__[0]
+        self.assertEqual(annotated.__metadata__, ("x",))
+
+    def test_metadata_order_preserved(self):
+        T = TypeVar("T")
+        Alias = TypeAliasType(
+            "Alias",
+            dict[str, Annotated[T, "meta1", "meta2"]],
+            type_params=(T,),
+        )
+        value, pending = instantiate_alias(Alias, int)
+        self.assertEqual(pending, [])
+        annotated = value.__args__[1]
+        self.assertEqual(annotated.__metadata__, ("meta1", "meta2"))
+
+    def test_union_substitution(self):
+        T = TypeVar("T")
+        T2 = TypeVar("T2")
+        Alias = TypeAliasType(
+            "Alias", Union[int, T, list[T2]], type_params=(T, T2)
+        )
+        value, pending = instantiate_alias(Alias, (str, float))
+        self.assertEqual(value, Union[int, str, list[float]])
+        self.assertEqual(pending, [])
+
+    @skipUnless(TYPING_3_10_0, "types.UnionType is not available before 3.10")
+    def test_union_type_substitution(self):
+        T = TypeVar("T")
+        Alias = TypeAliasType("Alias", T | str, type_params=(T,))
+        value, pending = instantiate_alias(Alias, int)
+        self.assertEqual(value, int | str)
+        self.assertEqual(pending, [])
+
+    def test_defaults_filled_in(self):
+        T = TypeVar("T")
+        T_default = TypeVar("T_default", default=str)
+        Alias = TypeAliasType(
+            "Alias", dict[T, T_default], type_params=(T, T_default)
+        )
+        # Explicit value for T, default for T_default
+        value, pending = instantiate_alias(Alias, (int,))
+        self.assertEqual(value, dict[int, str])
+        self.assertEqual(pending, [])
+        # Both explicit
+        value, pending = instantiate_alias(Alias, (int, float))
+        self.assertEqual(value, dict[int, float])
+        self.assertEqual(pending, [])
+
+    def test_nested_alias_expanded(self):
+        T = TypeVar("T")
+        Inner = TypeAliasType("Inner", list[T], type_params=(T,))
+        Outer = TypeAliasType("Outer", Inner[T], type_params=(T,))
+        value, pending = instantiate_alias(Outer, int)
+        self.assertEqual(value, list[int])
+        self.assertEqual(pending, [])
+
+    def test_recursive_alias_keeps_back_edge(self):
+        T = TypeVar("T")
+        Rec = TypeAliasType(
+            "Rec", list[Union[T, "Rec"]], type_params=(T,)
+        )
+        value, pending = instantiate_alias(
+            Rec, int, names={"Rec": Rec}
+        )
+        self.assertEqual(pending, [])
+        # The result contains a back-edge AliasReference pointing to Rec
+        refs = _find_alias_references(value)
+        self.assertEqual(len(refs), 1)
+        self.assertIs(refs[0].alias, Rec)
+        # The substituted part is correct
+        self.assertEqual(value.__args__[0].__args__[0], int)
+
+    def test_mutual_recursion_keeps_back_edge(self):
+        T = TypeVar("T")
+        T_default = TypeVar("T_default", default=int)
+        A = TypeAliasType(
+            "A", list[Union[T, "B"]], type_params=(T,)
+        )
+        B = TypeAliasType(
+            "B", list[Union[T_default, "A"]], type_params=(T_default,)
+        )
+        value, pending = instantiate_alias(
+            A, int, names={"B": B, "A": A}
+        )
+        self.assertEqual(pending, [])
+        refs = _find_alias_references(value)
+        # B is expanded (it has a default); A is the back-edge
+        self.assertEqual(len(refs), 1)
+        self.assertIs(refs[0].alias, A)
+
+    def test_missing_name_marked_pending(self):
+        T = TypeVar("T")
+        Alias = TypeAliasType(
+            "Alias", list[Union[T, "Missing"]], type_params=(T,)
+        )
+        value, pending = instantiate_alias(Alias, int)
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0].name, "Missing")
+        self.assertEqual(pending[0].path, (0, 1))
+        # The pending item is also embedded in the result
+        self.assertIs(value.__args__[0].__args__[1], pending[0])
+
+    def test_multiple_missing_names(self):
+        T = TypeVar("T")
+        Alias = TypeAliasType(
+            "Alias",
+            list[Union[T, "Foo", "Bar"]],
+            type_params=(T,),
+        )
+        value, pending = instantiate_alias(Alias, int)
+        self.assertEqual(len(pending), 2)
+        self.assertEqual({p.name for p in pending}, {"Foo", "Bar"})
+        self.assertEqual(pending[0].path, (0, 1))
+        self.assertEqual(pending[1].path, (0, 2))
+
+    def test_forward_ref_resolved_via_names(self):
+        T = TypeVar("T")
+        Alias = TypeAliasType(
+            "Alias", list[Union[T, "Foo"]], type_params=(T,)
+        )
+        value, pending = instantiate_alias(
+            Alias, int, names={"Foo": str}
+        )
+        self.assertEqual(value, list[Union[int, str]])
+        self.assertEqual(pending, [])
+
+    def test_forward_ref_not_evaluated(self):
+        # A ForwardRef to a name that would fail to evaluate must not raise.
+        T = TypeVar("T")
+        Alias = TypeAliasType(
+            "Alias", list[Union[T, "DoesNotExist"]], type_params=(T,)
+        )
+        # No names table -> the ForwardRef is unresolved, not evaluated
+        value, pending = instantiate_alias(Alias, int)
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0].name, "DoesNotExist")
+
+    def test_forward_ref_with_typevar_in_names(self):
+        T = TypeVar("T")
+        T2 = TypeVar("T2")
+        Alias = TypeAliasType(
+            "Alias", list[Union[T, "Foo"]], type_params=(T,)
+        )
+        value, pending = instantiate_alias(
+            Alias, int, names={"Foo": list[T2]}
+        )
+        self.assertEqual(value, list[Union[int, list[T2]]])
+        self.assertEqual(pending, [])
+
+    def test_callable_substitution(self):
+        T = TypeVar("T")
+        Alias = TypeAliasType(
+            "Alias", Callable[[T], T], type_params=(T,)
+        )
+        value, pending = instantiate_alias(Alias, int)
+        self.assertEqual(value, Callable[[int], int])
+        self.assertEqual(pending, [])
+
+    def test_result_parameters(self):
+        T = TypeVar("T")
+        T2 = TypeVar("T2")
+        Alias = TypeAliasType(
+            "Alias", list[Union[T, T2]], type_params=(T,)
+        )
+        value, pending = instantiate_alias(Alias, int)
+        self.assertEqual(value.__parameters__, (T2,))
+
+    def test_simple_alias_no_params(self):
+        Simple = TypeAliasType("Simple", int)
+        value, pending = instantiate_alias(Simple, ())
+        self.assertIs(value, int)
+        self.assertEqual(pending, [])
+
+    def test_too_many_arguments_raises(self):
+        T = TypeVar("T")
+        Alias = TypeAliasType("Alias", list[T], type_params=(T,))
+        with self.assertRaisesRegex(TypeError, "too many arguments"):
+            instantiate_alias(Alias, (int, str))
+
+    def test_missing_argument_raises(self):
+        T = TypeVar("T")
+        Alias = TypeAliasType("Alias", list[T], type_params=(T,))
+        with self.assertRaisesRegex(TypeError, "missing argument"):
+            instantiate_alias(Alias, ())
+
+    def test_non_type_alias_raises(self):
+        with self.assertRaisesRegex(TypeError, "expected a TypeAliasType"):
+            instantiate_alias(int, ())
+
+    def test_names_must_be_dict(self):
+        T = TypeVar("T")
+        Alias = TypeAliasType("Alias", list[T], type_params=(T,))
+        with self.assertRaisesRegex(TypeError, "names must be a dict"):
+            instantiate_alias(Alias, int, names=[])
+
+    def test_single_arg_not_tuple(self):
+        T = TypeVar("T")
+        Alias = TypeAliasType("Alias", list[T], type_params=(T,))
+        # A single type (not a tuple) is accepted
+        value, pending = instantiate_alias(Alias, int)
+        self.assertEqual(value, list[int])
+
+    def test_pending_type_repr_and_eq(self):
+        p1 = PendingType("Foo", (0, 1))
+        p2 = PendingType("Foo", (0, 1))
+        p3 = PendingType("Bar", (0, 1))
+        self.assertEqual(p1, p2)
+        self.assertNotEqual(p1, p3)
+        self.assertIn("Foo", repr(p1))
+
+    def test_alias_reference_repr_and_eq(self):
+        T = TypeVar("T")
+        Alias = TypeAliasType("Alias", list[T], type_params=(T,))
+        r1 = AliasReference(Alias)
+        r2 = AliasReference(Alias)
+        self.assertEqual(r1, r2)
+        self.assertIs(r1.alias, Alias)
+        self.assertIn("Alias", repr(r1))
+
+
+def _find_alias_references(obj):
+    """Collect all AliasReference nodes within *obj*."""
+    refs = []
+    if isinstance(obj, AliasReference):
+        refs.append(obj)
+    if isinstance(obj, typing._GenericAlias):
+        for a in obj.__args__:
+            refs.extend(_find_alias_references(a))
+    if isinstance(obj, types.GenericAlias):
+        for a in obj.__args__:
+            refs.extend(_find_alias_references(a))
+    if isinstance(obj, types.UnionType):
+        for a in obj.__args__:
+            refs.extend(_find_alias_references(a))
+    return refs
+
 
 class DocTests(BaseTestCase):
     def test_annotation(self):

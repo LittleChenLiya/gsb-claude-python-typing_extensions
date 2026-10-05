@@ -562,6 +562,114 @@ Special typing primitives
 
    .. versionadded:: 4.6.0
 
+.. function:: instantiate_alias(alias, args=(), *, names=None)
+
+   Explicitly instantiate a :py:class:`TypeAliasType` by substituting its
+   type parameters. This performs a pure structural substitution: the
+   alias's type parameters are replaced by the supplied type arguments (with
+   defaults filled in for parameters that have them), and the resulting type
+   expression is returned.
+
+   Unlike simply subscripting the alias (``alias[args]``), this function
+   walks the alias's stored expression and substitutes type parameters
+   directly. It also:
+
+   * Preserves the order of ``Annotated`` metadata.
+   * Expands nested aliases, but emits a finite back-edge reference node for
+     recursive aliases instead of expanding them infinitely.
+   * Resolves string forward references only through the *names* mapping;
+     they are never evaluated. Names that cannot be resolved become pending
+     items.
+
+   Returns a 2-tuple ``(value, pending)`` where *value* is the instantiated
+   type expression and *pending* is a list of :class:`PendingType` objects
+   for any names that could not be resolved.
+
+   Example::
+
+       T = TypeVar("T")
+       Alias = TypeAliasType("Alias", list[Annotated[T, "x"]], type_params=(T,))
+       value, pending = instantiate_alias(Alias, int)
+       # value == list[Annotated[int, "x"]]
+       # pending == []
+
+   .. versionadded:: 4.16.0
+
+.. class:: PendingType(name, path)
+
+   A type that could not be resolved during alias instantiation. A pending
+   type is a placeholder for a name that appeared as a string forward
+   reference but was not present in the name table supplied to
+   :func:`instantiate_alias`.
+
+   .. attribute:: name
+
+      The unresolved name (the forward reference argument).
+
+   .. attribute:: path
+
+      A tuple describing the location of the pending name within the root
+      expression. Each element is either an ``int`` (an index into a type's
+      arguments) or a ``str`` (a named slot).
+
+   .. versionadded:: 4.16.0
+
+.. class:: AliasReference(alias)
+
+   A back-edge reference to a recursive type alias. When a type alias
+   references itself (directly or indirectly), :func:`instantiate_alias`
+   emits an ``AliasReference`` instead of expanding the alias infinitely.
+
+   .. attribute:: alias
+
+      The :py:class:`TypeAliasType` that closes the cycle.
+
+   .. versionadded:: 4.16.0
+
+Support scope for explicit alias instantiation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:func:`instantiate_alias` supports substituting type parameters into the
+following constructs:
+
+* Plain types (``int``, ``str``, ``None``, ...)
+* :py:class:`TypeVar`\ s (substituted positionally, with defaults filled in)
+* ``Union[...]`` and ``X | Y`` unions
+* ``Annotated[...]`` (the type is substituted; metadata is kept in order)
+* ``list[...]``, ``dict[...]``, and other :class:`types.GenericAlias`
+  containers
+* ``Callable[...]`` (parameter list and return type)
+* Nested :py:class:`TypeAliasType`\ s (expanded, with back-edge detection)
+* String forward references (resolved only via the *names* mapping)
+
+The following are **not** supported:
+
+* Evaluating or forcing lazy forward references. Forward references are only
+  resolved through the *names* mapping; they are never evaluated.
+* Substituting into ``Annotated`` metadata. The metadata is kept in order but
+  is not treated as a type.
+* Infinite expansion of recursive aliases. A finite back-edge reference node
+  is emitted instead.
+
+Running the tests
+~~~~~~~~~~~~~~~~~
+
+The tests for explicit alias instantiation live in the
+``TypeAliasInstantiationTests`` class in ``src/test_typing_extensions.py``.
+To run only these tests::
+
+    cd src/
+    python -m pytest test_typing_extensions.py::TypeAliasInstantiationTests
+
+Or with ``unittest`` (no pytest dependency required)::
+
+    cd src/
+    python -m unittest test_typing_extensions.TypeAliasInstantiationTests
+
+Running these commands in the ``src/`` directory ensures that the local file
+``typing_extensions.py`` is used, instead of any other version of the library
+you may have installed.
+
 .. data:: TypeForm
 
    See :pep:`747`. A special form representing the value of a type expression.

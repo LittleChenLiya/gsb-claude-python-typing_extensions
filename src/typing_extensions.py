@@ -65,6 +65,7 @@ __all__ = [
     'Writer',
 
     # One-off things.
+    'AliasReference',
     'Annotated',
     'assert_never',
     'assert_type',
@@ -84,12 +85,14 @@ __all__ = [
     'get_protocol_members',
     'get_type_hints',
     'IntVar',
+    'instantiate_alias',
     'is_protocol',
     'is_typeddict',
     'Literal',
     'NewType',
     'overload',
     'override',
+    'PendingType',
     'Protocol',
     'sentinel',
     'Sentinel',
@@ -3931,6 +3934,294 @@ else:
                 if not _is_unionable(left):
                     return NotImplemented
                 return typing.Union[left, self]
+
+
+# ---------------------------------------------------------------------------
+# Explicit instantiation of TypeAliasType
+# ---------------------------------------------------------------------------
+
+class PendingType:
+    """A type that could not be resolved during alias instantiation.
+
+    A pending type is a placeholder for a name that appeared as a string
+    forward reference but was not present in the name table supplied to
+    :func:`instantiate_alias`. It records both the unresolved name and its
+    location within the instantiated expression.
+
+    Attributes:
+        name: The unresolved name (the forward reference argument).
+        path: A tuple describing the location of the pending name within the
+            root expression. Each element is either an ``int`` (an index into
+            a type's arguments) or a ``str`` (a named slot).
+    """
+
+    __slots__ = ("name", "path")
+
+    def __init__(self, name, path):
+        self.name = name
+        self.path = path
+
+    def __repr__(self):
+        return f"PendingType({self.name!r}, path={self.path!r})"
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, PendingType)
+            and self.name == other.name
+            and self.path == other.path
+        )
+
+    def __hash__(self):
+        return hash((self.name, self.path))
+
+
+class AliasReference:
+    """A back-edge reference to a recursive type alias.
+
+    When a type alias references itself (directly or indirectly),
+    :func:`instantiate_alias` emits an :class:`AliasReference` instead of
+    expanding the alias infinitely. The reference points back to the alias
+    that was being expanded when the cycle was detected.
+
+    Attributes:
+        alias: The :class:`TypeAliasType` that closes the cycle.
+    """
+
+    __slots__ = ("alias",)
+
+    def __init__(self, alias):
+        self.alias = alias
+
+    def __repr__(self):
+        return f"AliasReference({self.alias!r})"
+
+    def __eq__(self, other):
+        return isinstance(other, AliasReference) and self.alias is other.alias
+
+    def __hash__(self):
+        return hash(id(self.alias))
+
+
+def _bind_type_params(alias, args):
+    """Bind *alias*'s type parameters, filling defaults for missing arguments.
+
+    Returns a dict mapping each type parameter to its bound value.
+
+    Raises:
+        TypeError: If too many arguments are supplied or a parameter cannot
+            be bound (no argument and no default).
+    """
+    params = alias.__type_params__
+    if len(args) > len(params):
+        raise TypeError(
+            f"too many arguments for {alias.__name__}: "
+            f"expected at most {len(params)}, got {len(args)}"
+        )
+    mapping = {}
+    for i, param in enumerate(params):
+        if i < len(args):
+            mapping[param] = args[i]
+        else:
+            default = getattr(param, "__default__", NoDefault)
+            if default is not NoDefault:
+                mapping[param] = default
+            else:
+                raise TypeError(
+                    f"missing argument for type parameter {param!r} "
+                    f"of {alias.__name__}"
+                )
+    return mapping
+
+
+def _reconstruct_generic_alias(obj, new_args):
+    """Reconstruct a types.GenericAlias with substituted args."""
+    origin = obj.__origin__
+    # origin[args] normalizes a single arg vs. a tuple of args correctly.
+    try:
+        return origin[new_args]
+    except (TypeError, ValueError):
+        return _types.GenericAlias(origin, new_args)
+
+
+def _instantiate_generic_alias(obj, mapping, names, pending, path,
+                               active_aliases):
+    """Instantiate a typing._GenericAlias (Union, Annotated, Callable, ...)."""
+    # Annotated: only the origin (first arg) is substituted; the metadata is
+    # kept in order and is not treated as a type.
+    if get_origin(obj) is Annotated:
+        new_origin = _instantiate(
+            obj.__origin__, mapping, names, pending, (*path, 0),
+            active_aliases,
+        )
+        return obj.copy_with((new_origin,))
+
+    new_args = tuple(
+        _instantiate(a, mapping, names, pending, (*path, i), active_aliases)
+        for i, a in enumerate(obj.__args__)
+    )
+    # _ConcatenateGenericAlias.copy_with may return a tuple rather than a
+    # _GenericAlias.
+    result = obj.copy_with(new_args)
+    if isinstance(result, tuple):
+        return tuple(result)
+    return result
+
+
+def _instantiate(obj, mapping, names, pending, path, active_aliases):
+    """Recursively substitute type parameters in *obj*.
+
+    This is the core of :func:`instantiate_alias`. It walks the expression
+    tree, substituting type parameters, resolving forward references, and
+    detecting recursive aliases.
+    """
+    # TypeVar: look up in the current binding.
+    if isinstance(obj, TypeVar):
+        return mapping.get(obj, obj)
+
+    # ForwardRef: resolve only via the provided name table; never evaluate.
+    if isinstance(obj, ForwardRef):
+        arg = obj.__forward_arg__
+        if arg in names:
+            return _instantiate(
+                names[arg], mapping, names, pending, path, active_aliases
+            )
+        pt = PendingType(arg, path)
+        pending.append(pt)
+        return pt
+
+    # TypeAliasType: expand, but emit a back-edge if already being expanded.
+    if isinstance(obj, TypeAliasType):
+        if obj in active_aliases:
+            return AliasReference(obj)
+        new_active = active_aliases | {obj}
+        try:
+            sub_mapping = _bind_type_params(obj, ())
+        except TypeError:
+            # Cannot expand (bare alias with non-defaulted params); keep as a
+            # reference to the alias.
+            return obj
+        return _instantiate(
+            obj.__value__, sub_mapping, names, pending, path, new_active
+        )
+
+    # types.GenericAlias (e.g. list[T], Alias[T]).
+    if isinstance(obj, _types.GenericAlias):
+        origin = obj.__origin__
+        if isinstance(origin, TypeAliasType):
+            if origin in active_aliases:
+                return AliasReference(origin)
+            new_active = active_aliases | {origin}
+            sub_args = tuple(
+                _instantiate(a, mapping, names, pending, (*path, i),
+                             new_active)
+                for i, a in enumerate(obj.__args__)
+            )
+            sub_mapping = _bind_type_params(origin, sub_args)
+            return _instantiate(
+                origin.__value__, sub_mapping, names, pending, path,
+                new_active,
+            )
+        new_args = tuple(
+            _instantiate(a, mapping, names, pending, (*path, i),
+                         active_aliases)
+            for i, a in enumerate(obj.__args__)
+        )
+        return _reconstruct_generic_alias(obj, new_args)
+
+    # typing._GenericAlias (Union, Annotated, Callable, Literal, ...).
+    if isinstance(obj, typing._GenericAlias):
+        return _instantiate_generic_alias(
+            obj, mapping, names, pending, path, active_aliases
+        )
+
+    # types.UnionType (e.g. int | str).
+    if isinstance(obj, _types.UnionType):
+        new_args = tuple(
+            _instantiate(a, mapping, names, pending, (*path, i),
+                         active_aliases)
+            for i, a in enumerate(obj.__args__)
+        )
+        return functools.reduce(operator.or_, new_args)
+
+    # Containers: tuple and list (e.g. Callable's parameter list).
+    if isinstance(obj, tuple):
+        return tuple(
+            _instantiate(a, mapping, names, pending, (*path, i),
+                         active_aliases)
+            for i, a in enumerate(obj)
+        )
+    if isinstance(obj, list):
+        return [
+            _instantiate(a, mapping, names, pending, (*path, i),
+                         active_aliases)
+            for i, a in enumerate(obj)
+        ]
+
+    # Leaf type (int, str, None, ..., Ellipsis): return as-is.
+    return obj
+
+
+def instantiate_alias(alias, args=(), *, names=None):
+    """Explicitly instantiate a :class:`TypeAliasType`.
+
+    This performs a pure structural substitution: the alias's type parameters
+    are replaced by the supplied type arguments (with defaults filled in for
+    parameters that have them), and the resulting type expression is returned.
+
+    Unlike simply subscripting the alias (``alias[args]``), this function
+    walks the alias's stored expression and substitutes type parameters
+    directly. It also:
+
+    * Preserves the order of ``Annotated`` metadata.
+    * Expands nested aliases, but emits a finite back-edge reference node for
+      recursive aliases instead of expanding them infinitely.
+    * Resolves string forward references only through the *names* mapping;
+      they are never evaluated. Names that cannot be resolved become pending
+      items.
+
+    Args:
+        alias: The :class:`TypeAliasType` to instantiate.
+        args: The type arguments to substitute. May be a single type or a
+            tuple of types. Arguments are bound positionally to the alias's
+            type parameters; parameters with defaults need not be supplied.
+        names: An optional mapping from name to type, used to resolve string
+            forward references. Forward references are never evaluated; only
+            this mapping is consulted.
+
+    Returns:
+        tuple: A 2-tuple ``(value, pending)`` where *value* is the
+            instantiated type expression and *pending* is a list of
+            :class:`PendingType` objects for any names that could not be
+            resolved.
+
+    Raises:
+        TypeError: If *alias* is not a :class:`TypeAliasType`, if too many
+            arguments are supplied, or if a type parameter cannot be bound.
+
+    Example:
+        >>> T = TypeVar("T")
+        >>> Alias = TypeAliasType("Alias", list[Annotated[T, "x"]],
+        ...                       type_params=(T,))
+        >>> instantiate_alias(Alias, int)
+        (list[typing.Annotated[int, 'x']], [])
+    """
+    if not isinstance(alias, TypeAliasType):
+        raise TypeError(
+            f"expected a TypeAliasType, got {type(alias).__name__}"
+        )
+    if names is None:
+        names = {}
+    elif not isinstance(names, dict):
+        raise TypeError("names must be a dict or None")
+    if not isinstance(args, tuple):
+        args = (args,)
+
+    pending = []
+    mapping = _bind_type_params(alias, args)
+    value = _instantiate(
+        alias.__value__, mapping, names, pending, (), frozenset({alias})
+    )
+    return value, pending
 
 
 if hasattr(typing, "is_protocol"):
