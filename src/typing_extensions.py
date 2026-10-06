@@ -86,6 +86,8 @@ __all__ = [
     'IntVar',
     'is_protocol',
     'is_typeddict',
+    'plan_typeddict_update',
+    'DELETE',
     'Literal',
     'NewType',
     'overload',
@@ -1520,6 +1522,400 @@ else:
             is_typeddict(Union[list, str])  # => False
         """
         return isinstance(tp, _TYPEDDICT_TYPES)
+
+
+# ---------------------------------------------------------------------------
+# TypedDict update planning
+# ---------------------------------------------------------------------------
+
+class _DeleteSentinel:
+    """Sentinel used to explicitly delete a key in a TypedDict update plan."""
+    __slots__ = ()
+
+    def __repr__(self):
+        return "DELETE"
+
+    def __bool__(self):
+        return False
+
+
+DELETE = _DeleteSentinel()
+
+
+class _UnknownTypeError(TypeError):
+    """Raised when a TypedDict field's type cannot be checked safely.
+
+    The type checker only supports a fixed set of documented safe types
+    (builtin types and compositions thereof). Any other type -- including
+    user-defined classes, forward references, or unresolved type variables
+    -- is rejected rather than silently allowed.
+    """
+
+
+# Builtin types whose runtime representation is safe to check without calling
+# user code (no ``__instancecheck__`` / ``__subclasscheck__`` is invoked).
+_SAFE_BUILTIN_TYPES = frozenset({
+    int, float, str, bool, bytes, complex,
+    list, dict, tuple, set, frozenset,
+    type(None),
+})
+
+# Container generic types whose elements are checked recursively.
+_CONTAINER_TYPES = frozenset({list, dict, tuple, set, frozenset})
+
+_UNION_ORIGINS = tuple(
+    origin for origin in (typing.Union, getattr(_types, "UnionType", None))
+    if origin is not None
+)
+
+
+def _strip_typeddict_qualifiers(ann):
+    """Strip Annotated / Required / NotRequired / ReadOnly from an annotation.
+
+    Returns the underlying type and a frozenset of the qualifiers that were
+    present.
+    """
+    qualifiers = set()
+    while True:
+        origin = get_origin(ann)
+        if origin is Annotated:
+            ann = get_args(ann)[0]
+        elif origin is Required:
+            qualifiers.add(Required)
+            ann = get_args(ann)[0]
+        elif origin is NotRequired:
+            qualifiers.add(NotRequired)
+            ann = get_args(ann)[0]
+        elif origin is ReadOnly:
+            qualifiers.add(ReadOnly)
+            ann = get_args(ann)[0]
+        else:
+            return ann, frozenset(qualifiers)
+
+
+def _typeddict_origin_and_args(td):
+    """Return ``(origin_class, args)`` for a TypedDict class or generic alias.
+
+    For a plain TypedDict class, returns ``(td, ())``. For a generic alias
+    such as ``Box[int]``, returns ``(Box, (int,))``. For anything else,
+    returns ``(None, ())``.
+    """
+    origin = get_origin(td)
+    if origin is not None and is_typeddict(origin):
+        return origin, get_args(td)
+    if is_typeddict(td):
+        return td, ()
+    return None, ()
+
+
+def _collect_typeddict_subs(td, subs):
+    """Recursively collect TypeVar -> actual type bindings from a TypedDict's
+    ``__orig_bases__`` chain."""
+    for base in getattr(td, "__orig_bases__", ()):
+        origin, args = _typeddict_origin_and_args(base)
+        if origin is None:
+            continue
+        for param, arg in zip(getattr(origin, "__parameters__", ()), args):
+            subs.setdefault(param, arg)
+        _collect_typeddict_subs(origin, subs)
+
+
+def _build_typeddict_subs(td):
+    """Build a ``{TypeVar: actual_type}`` map for a TypedDict class or alias.
+
+    Returns ``(subs, origin_class)``. Raises TypeError if ``td`` is not a
+    TypedDict class or a generic alias of one.
+    """
+    origin, args = _typeddict_origin_and_args(td)
+    if origin is None:
+        raise TypeError(
+            f"expected a TypedDict class or generic alias, got {td!r}"
+        )
+    subs = {}
+    for param, arg in zip(getattr(origin, "__parameters__", ()), args):
+        subs.setdefault(param, arg)
+    _collect_typeddict_subs(origin, subs)
+    return subs, origin
+
+
+def _resolve_type(ann, subs):
+    """Resolve TypeVars in ``ann`` using the ``subs`` mapping.
+
+    Returns the resolved type. Raises ``_UnknownTypeError`` if a type
+    variable cannot be resolved to a concrete type.
+    """
+    ann, _ = _strip_typeddict_qualifiers(ann)
+    seen = set()
+    while isinstance(ann, TypeVar):
+        if ann in seen:
+            raise _UnknownTypeError(
+                f"cyclic TypeVar binding for {ann!r}; the field type is not "
+                "a supported safe type"
+            )
+        seen.add(ann)
+        resolved = subs.get(ann)
+        if resolved is None or resolved is ann:
+            raise _UnknownTypeError(
+                f"cannot resolve TypeVar {ann!r}; the field type is not a "
+                "supported safe type"
+            )
+        ann = resolved
+        ann, _ = _strip_typeddict_qualifiers(ann)
+    return ann
+
+
+def _check_type_safe(ann, subs):
+    """Check that a type is supported by the safe-type whitelist.
+
+    TypeVars are resolved using ``subs``. Raises ``_UnknownTypeError`` if the
+    type (or any of its components) is not a documented safe type.
+    """
+    ann = _resolve_type(ann, subs)
+
+    # Top types and None are safe.
+    if ann is Any or ann is object:
+        return
+    if ann is None or ann is type(None):
+        return
+
+    origin = get_origin(ann)
+    if origin is None:
+        # Plain type.
+        if ann in _SAFE_BUILTIN_TYPES:
+            return
+        # Unsupported type (custom class, forward reference, etc.).
+        raise _UnknownTypeError(
+            f"field type {ann!r} is not a supported safe type"
+        )
+
+    args = get_args(ann)
+
+    # Union / Optional: every branch must be safe.
+    if origin in _UNION_ORIGINS:
+        for arg in args:
+            if arg is None or arg is type(None):
+                continue
+            _check_type_safe(arg, subs)
+        return
+
+    # Literal is safe.
+    if origin is Literal:
+        return
+
+    # Container generics: element types must be safe.
+    if origin in _CONTAINER_TYPES:
+        for arg in args:
+            if arg is Ellipsis:
+                continue
+            _check_type_safe(arg, subs)
+        return
+
+    # Unsupported generic type.
+    raise _UnknownTypeError(
+        f"field type {ann!r} is not a supported safe type"
+    )
+
+
+def _check_value_type(value, ann, subs):
+    """Check that ``value`` matches the annotation ``ann``.
+
+    TypeVars in ``ann`` are resolved using the ``subs`` mapping. Only a fixed
+    set of documented safe types are accepted; user ``isinstance`` logic is
+    never invoked. Raises TypeError (or ``_UnknownTypeError``) on failure.
+    """
+    _check_type_safe(ann, subs)
+    ann = _resolve_type(ann, subs)
+
+    # Top types: any value is allowed.
+    if ann is Any or ann is object:
+        return
+
+    # None.
+    if ann is None or ann is type(None):
+        if value is not None:
+            raise TypeError(
+                f"expected None, got {type(value).__name__}"
+            )
+        return
+
+    origin = get_origin(ann)
+    if origin is None:
+        # Plain type.
+        if ann in _SAFE_BUILTIN_TYPES:
+            if type(value) is not ann:
+                raise TypeError(
+                    f"expected {ann.__name__}, got {type(value).__name__}"
+                )
+            return
+        # Should not happen: _check_type_safe already rejected this.
+        raise _UnknownTypeError(
+            f"field type {ann!r} is not a supported safe type"
+        )
+
+    args = get_args(ann)
+
+    # Union / Optional.
+    if origin in _UNION_ORIGINS:
+        for arg in args:
+            if arg is None or arg is type(None):
+                if value is None:
+                    return
+                continue
+            try:
+                _check_value_type(value, arg, subs)
+                return
+            except _UnknownTypeError:
+                # An unknown branch makes the whole type unsupported.
+                raise
+            except TypeError:
+                continue
+        raise TypeError(
+            f"value {value!r} does not match any type in {ann!r}"
+        )
+
+    # Literal.
+    if origin is Literal:
+        if value in args:
+            return
+        raise TypeError(
+            f"value {value!r} is not one of {args!r}"
+        )
+
+    # Container generics: check the container type and recurse on elements.
+    if origin in _CONTAINER_TYPES:
+        if type(value) is not origin:
+            raise TypeError(
+                f"expected {origin.__name__}, got {type(value).__name__}"
+            )
+        if origin is list or origin is set or origin is frozenset:
+            if args:
+                (elem_type,) = args
+                for item in value:
+                    _check_value_type(item, elem_type, subs)
+        elif origin is tuple:
+            if args:
+                if len(args) == 2 and args[1] is Ellipsis:
+                    for item in value:
+                        _check_value_type(item, args[0], subs)
+                else:
+                    if len(value) != len(args):
+                        raise TypeError(
+                            f"expected tuple of length {len(args)}, "
+                            f"got {len(value)}"
+                        )
+                    for item, arg in zip(value, args):
+                        _check_value_type(item, arg, subs)
+        elif origin is dict:
+            if args:
+                key_type, val_type = args
+                for key, item in value.items():
+                    _check_value_type(key, key_type, subs)
+                    _check_value_type(item, val_type, subs)
+        return
+
+    # Should not happen: _check_type_safe already rejected this.
+    raise _UnknownTypeError(
+        f"field type {ann!r} is not a supported safe type"
+    )
+
+
+def plan_typeddict_update(td, record, update, /):
+    """Plan a sparse update to a TypedDict record.
+
+    Validates *record* and *update* against the field metadata of the
+    TypedDict class *td* (Required / NotRequired / ReadOnly). Returns a new
+    record (a plain dict) with the update applied. The original *record* is
+    never modified.
+
+    Rules:
+
+    - Keys present in *record* but omitted from *update* are preserved.
+    - A key set to `DELETE` is explicitly removed. Deletion is only allowed
+      for optional, mutable (NotRequired, non-ReadOnly) fields.
+    - ReadOnly fields cannot be changed.
+    - Required fields cannot be deleted.
+    - Type checking uses only a fixed set of documented safe builtin types
+      and compositions thereof; user ``isinstance`` logic is never invoked.
+      Fields of any other type (custom classes, forward references,
+      unresolved type variables, ...) are rejected.
+    - All checks must pass before a result is produced; otherwise
+      ``TypeError`` is raised and *record* is left unchanged.
+
+    *td* may be a TypedDict class or a generic alias such as ``Box[int]``;
+    type variables are resolved to their actual bound types.
+
+    Example::
+
+        class User(TypedDict):
+            id: ReadOnly[int]
+            name: NotRequired[str]
+            age: int
+
+        record = User(id=1, age=30)
+        updated = plan_typeddict_update(User, record, {"age": 31})
+        assert updated == {"id": 1, "age": 31}
+        assert record == {"id": 1, "age": 30}  # unchanged
+    """
+    if not isinstance(record, dict):
+        raise TypeError(
+            f"record must be a dict, got {type(record).__name__}"
+        )
+    if not isinstance(update, dict):
+        raise TypeError(
+            f"update must be a dict, got {type(update).__name__}"
+        )
+
+    subs, origin = _build_typeddict_subs(td)
+
+    annotations = origin.__annotations__
+    required_keys = origin.__required_keys__
+    readonly_keys = origin.__readonly_keys__
+
+    # Validate every field's type. Fields with a value (in the record or the
+    # update) are checked against that value; fields without a value are still
+    # checked for type safety so that unknown types are never silently
+    # accepted.
+    for key, ann in annotations.items():
+        if key in record:
+            _check_value_type(record[key], ann, subs)
+        elif key in update and update[key] is not DELETE:
+            _check_value_type(update[key], ann, subs)
+        else:
+            _check_type_safe(ann, subs)
+
+    result = dict(record)
+
+    for key, value in update.items():
+        if key not in annotations:
+            raise TypeError(
+                f"unknown field {key!r} for TypedDict {origin.__name__!r}"
+            )
+        ann = annotations[key]
+
+        if value is DELETE:
+            # Explicit deletion: only optional, mutable fields may be removed.
+            if key in readonly_keys:
+                raise TypeError(
+                    f"cannot delete read-only field {key!r} of "
+                    f"TypedDict {origin.__name__!r}"
+                )
+            if key in required_keys:
+                raise TypeError(
+                    f"cannot delete required field {key!r} of "
+                    f"TypedDict {origin.__name__!r}"
+                )
+            result.pop(key, None)
+        else:
+            # Value update: read-only fields cannot be changed.
+            if key in readonly_keys:
+                raise TypeError(
+                    f"cannot modify read-only field {key!r} of "
+                    f"TypedDict {origin.__name__!r}"
+                )
+            _check_value_type(value, ann, subs)
+            result[key] = value
+
+    return result
 
 
 if hasattr(typing, "assert_type"):
