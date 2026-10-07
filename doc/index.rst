@@ -1113,6 +1113,50 @@ Functions
 
    .. versionadded:: 4.7.0
 
+.. function:: get_protocol_member_origins(tp)
+
+   Return the member-origin view of a :class:`Protocol`: a mapping whose keys
+   are exactly the members returned by :func:`get_protocol_members`, and whose
+   values are :class:`ProtocolMemberOrigin` pairs.
+
+   ``origin`` is the first base class in the MRO that is itself a Protocol and
+   declares the member -- the declaration that would win attribute lookup, with
+   diamond inheritance resolved according to the MRO.  It is ``None`` when the
+   member is only inherited from an ordinary, non-Protocol auxiliary base class
+   (such as a :mod:`collections.abc` base); such a class never masquerades as a
+   Protocol declaration.  ``overridden`` is ``True`` when the origin's
+   declaration overrides a same-named member declared by a Protocol base class.
+
+   Descriptors are never executed: declaration is detected from class
+   dictionaries and annotations only, so a ``property`` that raises on access
+   is reported without triggering it. This independent view never changes the
+   member set returned by :func:`get_protocol_members`.
+
+   ::
+
+      >>> from typing_extensions import Protocol, get_protocol_member_origins
+      >>> class Base(Protocol):
+      ...     def a(self) -> str: ...
+      >>> class Sub(Base, Protocol):
+      ...     b: int
+      >>> get_protocol_member_origins(Sub)['a'].origin is Base
+      True
+      >>> get_protocol_member_origins(Sub)['b'].overridden
+      False
+
+   Raise :py:exc:`TypeError` for arguments that are not Protocols.
+
+   .. versionadded:: 4.16.1
+
+.. class:: ProtocolMemberOrigin(origin, overridden)
+
+   A :py:func:`collections.namedtuple`-style pair describing the origin of one
+   Protocol member: the declaring :class:`Protocol` base class (or ``None``)
+   and a flag saying whether the declaration overrides one inherited from a
+   Protocol base.
+
+   .. versionadded:: 4.16.1
+
 .. function:: get_type_hints(obj, globalns=None, localns=None, include_extras=False)
 
    See :py:func:`typing.get_type_hints`.

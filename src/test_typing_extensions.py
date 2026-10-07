@@ -63,6 +63,7 @@ from typing_extensions import (
     ParamSpecArgs,
     ParamSpecKwargs,
     Protocol,
+    ProtocolMemberOrigin,
     ReadOnly,
     Required,
     Self,
@@ -93,6 +94,7 @@ from typing_extensions import (
     get_origin,
     get_original_bases,
     get_overloads,
+    get_protocol_member_origins,
     get_protocol_members,
     get_type_hints,
     is_protocol,
@@ -4076,6 +4078,132 @@ class ProtocolTests(BaseTestCase):
             get_protocol_members(ConcreteInherit)
         with self.assertRaisesRegex(TypeError, "not a Protocol"):
             get_protocol_members(ConcreteInherit())
+
+    def test_get_protocol_member_origins(self):
+        # Non-protocols are rejected, just like get_protocol_members().
+        with self.assertRaisesRegex(TypeError, "not a Protocol"):
+            get_protocol_member_origins(object)
+        with self.assertRaisesRegex(TypeError, "not a Protocol"):
+            get_protocol_member_origins(object())
+        with self.assertRaisesRegex(TypeError, "not a Protocol"):
+            get_protocol_member_origins(Protocol)
+        with self.assertRaisesRegex(TypeError, "not a Protocol"):
+            get_protocol_member_origins(Generic)
+
+        # A property whose getter raises: it is a valid protocol member,
+        # but merely inspecting origins must never evaluate it.
+        class ExplodingProperty:
+            def __get__(self, instance, owner=None):
+                raise AssertionError("descriptor must not be evaluated")
+
+        explosions = []
+
+        class ExplodingProperty2:
+            def __get__(self, instance, owner=None):
+                explosions.append(instance)
+                raise RuntimeError("boom")
+
+        # Diamond inheritance resolved according to the MRO.
+        class Left(Protocol):
+            only_left: int
+            shared: int
+            def same_name(self) -> str: ...
+
+        class Right(Protocol):
+            only_right: int
+            shared: int
+            def same_name(self) -> str: ...
+
+        class Diamond(Left, Right, Protocol):
+            only_diamond: int
+            # override of a same-named member inherited from Left
+            def same_name(self) -> str: ...
+            exploding: int = ExplodingProperty()  # type: ignore[assignment]
+            exploding2 = property(
+                lambda self: (_ for _ in ()).throw(RuntimeError("boom"))
+            )
+            exploding3: int = ExplodingProperty2()  # type: ignore[assignment]
+
+        origins = get_protocol_member_origins(Diamond)
+
+        # The keys are exactly the existing member set; the old API is
+        # untouched and a fresh mapping is returned on every call.
+        self.assertEqual(set(origins), set(get_protocol_members(Diamond)))
+        self.assertIsInstance(origins, dict)
+        self.assertIsNot(origins, get_protocol_member_origins(Diamond))
+        for value in origins.values():
+            self.assertIsInstance(value, ProtocolMemberOrigin)
+            self.assertIsInstance(value.overridden, bool)
+
+        # MRO: Diamond -> Left -> Right -> ...; Left wins the diamond.
+        self.assertEqual(origins['only_left'],
+                         ProtocolMemberOrigin(Left, False))
+        self.assertEqual(origins['only_right'],
+                         ProtocolMemberOrigin(Right, False))
+        self.assertEqual(origins['only_diamond'],
+                         ProtocolMemberOrigin(Diamond, False))
+        self.assertEqual(origins['shared'],
+                         ProtocolMemberOrigin(Left, True))
+        self.assertEqual(origins['same_name'],
+                         ProtocolMemberOrigin(Diamond, True))
+
+        # Descriptors are never executed: no exception, no side effects.
+        self.assertEqual(origins['exploding'].origin, Diamond)
+        self.assertFalse(origins['exploding'].overridden)
+        self.assertEqual(origins['exploding2'].origin, Diamond)
+        self.assertEqual(origins['exploding3'].origin, Diamond)
+        self.assertEqual(explosions, [])
+
+        # Sub-protocols inherit the origin view without touching descriptors.
+        class SubDiamond(Diamond, Protocol):
+            extra: int
+        sub_origins = get_protocol_member_origins(SubDiamond)
+        self.assertEqual(sub_origins['only_left'],
+                         ProtocolMemberOrigin(Left, False))
+        self.assertEqual(sub_origins['shared'],
+                         ProtocolMemberOrigin(Left, True))
+        self.assertEqual(sub_origins['same_name'],
+                         ProtocolMemberOrigin(Diamond, True))
+        self.assertEqual(sub_origins['exploding'],
+                         ProtocolMemberOrigin(Diamond, False))
+        self.assertEqual(sub_origins['extra'],
+                         ProtocolMemberOrigin(SubDiamond, False))
+        self.assertEqual(explosions, [])
+
+        # Ordinary (non-Protocol) auxiliary bases mixed into a protocol
+        # must never masquerade as a Protocol declaration: the origin is
+        # None for members only provided by such a base.
+        from collections.abc import Iterable
+        class MixesHelper(Iterable, Protocol):
+            own_member: int
+        mix_origins = get_protocol_member_origins(MixesHelper)
+        self.assertEqual(mix_origins['own_member'],
+                         ProtocolMemberOrigin(MixesHelper, False))
+        self.assertIn('__iter__', mix_origins)
+        self.assertIsNone(mix_origins['__iter__'].origin)
+        self.assertFalse(mix_origins['__iter__'].overridden)
+
+        # Concrete classes and instances are rejected.
+        class Concrete(Diamond):
+            pass
+        with self.assertRaisesRegex(TypeError, "not a Protocol"):
+            get_protocol_member_origins(Concrete)
+        with self.assertRaisesRegex(TypeError, "not a Protocol"):
+            get_protocol_member_origins(Concrete())
+
+    def test_get_protocol_member_origins_typing(self):
+        # The origin view works with typing.Protocol bases as well.
+        class Base(typing.Protocol):
+            a: int
+            def m(self) -> str: ...
+
+        class Sub(Base, typing.Protocol):
+            def m(self) -> str: ...
+
+        origins = get_protocol_member_origins(Sub)
+        self.assertEqual(set(origins), set(get_protocol_members(Sub)))
+        self.assertEqual(origins['a'], ProtocolMemberOrigin(Base, False))
+        self.assertEqual(origins['m'], ProtocolMemberOrigin(Sub, True))
 
     def test_is_protocol(self):
         self.assertTrue(is_protocol(Proto))

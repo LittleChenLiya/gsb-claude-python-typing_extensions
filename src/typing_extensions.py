@@ -82,6 +82,8 @@ __all__ = [
     'get_origin',
     'get_original_bases',
     'get_protocol_members',
+    'get_protocol_member_origins',
+    'ProtocolMemberOrigin',
     'get_type_hints',
     'IntVar',
     'is_protocol',
@@ -713,6 +715,69 @@ def _get_protocol_attrs(cls):
             if (not attr.startswith('_abc_') and attr not in _EXCLUDED_ATTRS):
                 attrs.add(attr)
     return attrs
+
+
+def _mro_declares_attr(base, attr):
+    """Return True if *base* itself declares *attr*.
+
+    Only the class dictionary and the (un-evaluated) annotations are inspected,
+    so descriptors (e.g. properties) are never invoked and evaluation of
+    annotation defaults is never triggered.
+    """
+    if attr in base.__dict__:
+        return True
+    annotations = getattr(base, '__annotations__', None)
+    return (
+        isinstance(annotations, collections.abc.Mapping)
+        and attr in annotations
+    )
+
+
+def _get_protocol_member_origins(cls):
+    """Compute the member-origin view for a Protocol class.
+
+    Returns a fresh ``dict`` mapping every member name (exactly the names
+    returned for the member set) to a ``(origin, overridden)`` pair.
+
+    The origin is the first base in the MRO that is itself a Protocol and
+    declares the member -- the class that wins the attribute lookup, with
+    diamond inheritance resolved according to the MRO.  It is ``None`` for
+    members only inherited from an ordinary (non-Protocol) auxiliary base,
+    which must never masquerade as a Protocol declaration.
+
+    ``overridden`` is True if a Protocol further down the MRO declares the
+    same member, i.e. the origin's declaration covers one inherited from a
+    Protocol base class.
+
+    Descriptors are never executed: declaration is detected from class
+    dictionaries and annotations only.
+    """
+    bases = [
+        base for base in cls.__mro__[:-1]  # without object
+        if base.__name__ not in {'Protocol', 'Generic'}
+    ]
+    # Use the exact same member names as the member-set API, preferring the
+    # cached attribute when available, so the two views never diverge.
+    members = getattr(cls, '__protocol_attrs__', None)
+    if members is None:
+        members = _get_protocol_attrs(cls)
+    origins = {}
+    for attr in members:
+        origin = None
+        overridden = False
+        for index, base in enumerate(bases):
+            if not is_protocol(base):
+                continue
+            if not _mro_declares_attr(base, attr):
+                continue
+            if origin is None:
+                origin = base
+                overridden = any(
+                    is_protocol(earlier) and _mro_declares_attr(earlier, attr)
+                    for earlier in bases[index + 1:]
+                )
+        origins[attr] = ProtocolMemberOrigin(origin, overridden)
+    return origins
 
 
 # `__match_args__` attribute was removed from protocol members in 3.13,
@@ -3933,6 +3998,23 @@ else:
                 return typing.Union[left, self]
 
 
+class ProtocolMemberOrigin(typing.NamedTuple):
+    """Origin information for a single Protocol member.
+
+    Attributes:
+        origin: the first base class in the MRO that is itself a Protocol
+            and declares the member (diamond inheritance being resolved
+            according to the MRO), or ``None`` if the member is only
+            inherited from an ordinary, non-Protocol auxiliary base class.
+        overridden: ``True`` if a Protocol further down the MRO (a base
+            class of ``origin``) declares the same member, i.e. the
+            ``origin`` declaration overrides an inherited one.
+    """
+
+    origin: typing.Optional[type]
+    overridden: bool
+
+
 if hasattr(typing, "is_protocol"):
     is_protocol = typing.is_protocol
     get_protocol_members = typing.get_protocol_members
@@ -3977,6 +4059,54 @@ else:
         if hasattr(tp, '__protocol_attrs__'):
             return frozenset(tp.__protocol_attrs__)
         return frozenset(_get_protocol_attrs(tp))
+
+
+def get_protocol_member_origins(
+    tp: type, /
+) -> typing.Dict[str, "ProtocolMemberOrigin"]:
+    """Return the member-origin view of a Protocol.
+
+    This is an independent view that does not change the member set returned
+    by :func:`get_protocol_members`: the mapping's keys are exactly the
+    members of *tp*.
+
+    Each value is a :class:`ProtocolMemberOrigin` pair:
+
+    * ``origin`` is the first base class in the MRO that is itself a
+      Protocol and declares the member -- the declaration that wins
+      attribute lookup, with diamond inheritance resolved according to the
+      MRO.  It is ``None`` when the member is only inherited from an
+      ordinary, non-Protocol auxiliary base class; such a base class never
+      masquerades as a Protocol declaration.
+    * ``overridden`` is ``True`` when the origin's declaration overrides a
+      member of the same name declared by a Protocol base class.
+
+    Descriptors are never executed; declaration is detected from class
+    dictionaries and annotations only, so a ``property`` that raises on
+    access is reported without triggering it.
+
+    Example::
+
+        >>> from typing_extensions import (
+        ...     Protocol, get_protocol_member_origins,
+        ... )
+        >>> class Base(Protocol):
+        ...     def a(self) -> str: ...
+        >>> class Sub(Base, Protocol):
+        ...     b: int
+        >>> origins = get_protocol_member_origins(Sub)
+        >>> origins['a'].origin is Base
+        True
+        >>> origins['a'].overridden
+        False
+        >>> origins['b'].origin is Sub
+        True
+
+    Raise a TypeError for arguments that are not Protocols.
+    """
+    if not is_protocol(tp):
+        raise TypeError(f'{tp!r} is not a Protocol')
+    return _get_protocol_member_origins(tp)
 
 
 if hasattr(typing, "Doc"):

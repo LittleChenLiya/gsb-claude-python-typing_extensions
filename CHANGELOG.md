@@ -1,3 +1,13 @@
+# Unreleased
+
+- Add `get_protocol_member_origins` and the `ProtocolMemberOrigin` type, an
+  independent member-origin view for Protocols. For each member they report the
+  first declaring Protocol base class along the MRO (with diamond inheritance
+  resolved by the MRO, ordinary non-Protocol auxiliary bases reporting `None`)
+  and whether the declaration overrides a same-named member inherited from a
+  Protocol base. Descriptors are never evaluated and `get_protocol_members` is
+  unchanged.
+
 # Release 4.16.0 (July 2, 2025)
 
 No user-facing changes since 4.16.0rc2.
