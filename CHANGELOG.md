@@ -1,3 +1,12 @@
+# Unreleased
+
+- Add `typing_extensions.protocol_mismatch_reason()`, a diagnostic helper
+  that explains why an object fails to match a `@runtime_checkable`
+  protocol. It distinguishes a missing protocol member from a method
+  member that is `None`, never triggers `property` objects or
+  `__getattr__` (members are inspected with `inspect.getattr_static`),
+  and its verdict is always consistent with `isinstance()`.
+
 # Release 4.16.0 (July 2, 2025)
 
 No user-facing changes since 4.16.0rc2.

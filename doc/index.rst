@@ -1169,6 +1169,41 @@ Functions
       :data:`TypedDict` itself as the argument, consistent with the
       behavior of :py:func:`typing.is_typeddict`.
 
+.. function:: protocol_mismatch_reason(proto, instance)
+
+   Explain why *instance* fails to match the runtime-checkable protocol
+   *proto*. Return ``None`` if ``isinstance(instance, proto)`` is
+   ``True``; otherwise return a human-readable string describing the
+   first mismatch found: either a protocol member that is missing on the
+   instance, or a method member that is ``None`` on the instance.
+
+   Members are inspected with :py:func:`inspect.getattr_static`, exactly
+   like the runtime ``isinstance()`` check itself, so the diagnostic
+   never triggers ``property`` objects or ``__getattr__``, and its
+   verdict is always consistent with ``isinstance(instance, proto)``.
+
+   Only protocols decorated with ``@runtime_checkable`` are supported;
+   ``TypeError`` is raised for anything else.
+
+   For example::
+
+      @runtime_checkable
+      class Closable(Protocol):
+          def close(self): ...
+
+      class Missing:
+          pass
+
+      class NoneMethod:
+          close = None
+
+      protocol_mismatch_reason(Closable, Missing())
+      # => "... missing protocol member 'close'"
+      protocol_mismatch_reason(Closable, NoneMethod())
+      # => "... method member 'close' is None"
+
+   .. versionadded:: 4.17.0
+
 .. function:: reveal_type(obj)
 
    See :py:func:`typing.reveal_type`. In ``typing`` since 3.11.

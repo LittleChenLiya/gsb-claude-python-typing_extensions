@@ -100,6 +100,7 @@ from typing_extensions import (
     no_type_check,
     overload,
     override,
+    protocol_mismatch_reason,
     reveal_type,
     runtime,
     runtime_checkable,
@@ -4251,6 +4252,128 @@ class ProtocolTests(BaseTestCase):
             def foo(self): pass
 
         self.assertIsSubclass(Bar, Functor)
+
+
+class ProtocolMismatchReasonTests(BaseTestCase):
+    """Regression tests for protocol_mismatch_reason().
+
+    The diagnostic must always agree with isinstance() on the original
+    runtime-checkable protocol interface, and must never trigger
+    properties or __getattr__ on the inspected object.
+    """
+
+    def assertConsistent(self, proto, instance):
+        """The diagnostic agrees with isinstance() either way."""
+        reason = protocol_mismatch_reason(proto, instance)
+        if isinstance(instance, proto):
+            self.assertIsNone(reason)
+        else:
+            self.assertIsInstance(reason, str)
+        return reason
+
+    def test_matching_object(self):
+        @runtime_checkable
+        class P(Protocol):
+            def meth(self): ...
+
+        class C:
+            def meth(self): ...
+
+        reason = self.assertConsistent(P, C())
+        self.assertIsNone(reason)
+
+    def test_missing_method_member(self):
+        @runtime_checkable
+        class P(Protocol):
+            def meth(self): ...
+
+        class C:
+            pass
+
+        reason = self.assertConsistent(P, C())
+        self.assertIn("missing protocol member 'meth'", reason)
+
+    def test_none_method_member(self):
+        @runtime_checkable
+        class P(Protocol):
+            def meth(self): ...
+
+        class C:
+            meth = None
+
+        reason = self.assertConsistent(P, C())
+        self.assertIn("method member 'meth' is None", reason)
+
+    def test_none_non_method_member_is_not_a_mismatch(self):
+        @runtime_checkable
+        class P(Protocol):
+            x: int
+
+        class C:
+            x = None
+
+        reason = self.assertConsistent(P, C())
+        self.assertIsNone(reason)
+
+    def test_raising_property_not_triggered(self):
+        @runtime_checkable
+        class P(Protocol):
+            x: int
+
+        triggered = []
+
+        class C:
+            @property
+            def x(self):
+                triggered.append(True)
+                raise RuntimeError("property was called")
+
+        reason = self.assertConsistent(P, C())
+        self.assertIsNone(reason)
+        self.assertEqual(triggered, [])
+
+    def test_raising_descriptor_not_triggered(self):
+        @runtime_checkable
+        class P(Protocol):
+            def meth(self): ...
+
+        triggered = []
+
+        class Explosive:
+            def __get__(self, instance, owner=None):
+                triggered.append(True)
+                raise RuntimeError("descriptor was called")
+
+        class C:
+            def meth(self): ...
+            boom = Explosive()
+
+        reason = self.assertConsistent(P, C())
+        self.assertIsNone(reason)
+        self.assertEqual(triggered, [])
+
+    def test_getattr_not_triggered(self):
+        @runtime_checkable
+        class P(Protocol):
+            def meth(self): ...
+
+        class C:
+            def __getattr__(self, name):
+                raise AssertionError("__getattr__ was called")
+
+        reason = self.assertConsistent(P, C())
+        self.assertIn("missing protocol member 'meth'", reason)
+
+    def test_non_protocol_rejected(self):
+        with self.assertRaisesRegex(TypeError, "requires a protocol class"):
+            protocol_mismatch_reason(int, 1)
+
+    def test_non_runtime_checkable_protocol_rejected(self):
+        class P(Protocol):
+            def meth(self): ...
+
+        with self.assertRaisesRegex(TypeError, "@runtime_checkable protocols"):
+            protocol_mismatch_reason(P, object())
 
 
 class SpecificProtocolTests(BaseTestCase):

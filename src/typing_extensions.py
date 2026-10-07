@@ -91,6 +91,7 @@ __all__ = [
     'overload',
     'override',
     'Protocol',
+    'protocol_mismatch_reason',
     'sentinel',
     'Sentinel',
     'reveal_type',
@@ -958,6 +959,57 @@ else:
 
 # The "runtime" alias exists for backwards compatibility.
 runtime = runtime_checkable
+
+
+def protocol_mismatch_reason(proto, instance):
+    """Explain why *instance* fails to match a runtime-checkable protocol.
+
+    Return ``None`` if ``isinstance(instance, proto)`` is ``True``.
+    Otherwise, return a human-readable string describing the first
+    mismatch found: either a protocol member that is missing on the
+    instance, or a method member that is ``None`` on the instance.
+
+    Members are inspected with :func:`inspect.getattr_static`, exactly
+    like the runtime ``isinstance()`` check itself, so the diagnostic
+    never triggers ``property`` objects or ``__getattr__``, and its
+    verdict is always consistent with ``isinstance(instance, proto)``.
+
+    Only protocols decorated with ``@runtime_checkable`` are supported;
+    ``TypeError`` is raised for anything else.
+    """
+    if not getattr(proto, '_is_protocol', False):
+        raise TypeError(
+            "protocol_mismatch_reason() requires a protocol class, "
+            f"got {proto!r}"
+        )
+    if not getattr(proto, '_is_runtime_protocol', False):
+        raise TypeError(
+            "Instance and class checks can only be used with "
+            "@runtime_checkable protocols"
+        )
+    # Mirror _ProtocolMeta.__instancecheck__: a virtual subclass
+    # registration or a successful __subclasshook__ takes precedence.
+    if abc.ABCMeta.__instancecheck__(proto, instance):
+        return None
+    attrs = getattr(proto, '__protocol_attrs__', None)
+    if attrs is None:
+        attrs = _get_protocol_attrs(proto)
+    non_callable = getattr(proto, '__non_callable_proto_members__', None)
+    if non_callable is None:
+        non_callable = {
+            attr for attr in attrs
+            if not callable(getattr(proto, attr, None))
+        }
+    for attr in sorted(attrs):
+        try:
+            val = inspect.getattr_static(instance, attr)
+        except AttributeError:
+            return (f"{instance!r} does not match {proto!r}: "
+                    f"missing protocol member {attr!r}")
+        if val is None and attr not in non_callable:
+            return (f"{instance!r} does not match {proto!r}: "
+                    f"method member {attr!r} is None")
+    return None
 
 
 # Our version of runtime-checkable protocols is faster on Python <=3.11
