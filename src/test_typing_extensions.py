@@ -63,6 +63,7 @@ from typing_extensions import (
     ParamSpecArgs,
     ParamSpecKwargs,
     Protocol,
+    ProtocolMemberMismatch,
     ReadOnly,
     Required,
     Self,
@@ -87,6 +88,7 @@ from typing_extensions import (
     deprecated,
     disjoint_base,
     evaluate_forward_ref,
+    explain_protocol_mismatch,
     final,
     get_annotations,
     get_args,
@@ -3300,6 +3302,106 @@ class ProtocolTests(BaseTestCase):
             __slots__ = ("x",)
 
         self.assertIsInstance(HasNothingButSlots(), HasX)
+
+    def test_explain_protocol_mismatch(self):
+        @runtime_checkable
+        class P(Protocol):
+            def meth(self): ...
+            def other(self): ...
+
+        class Match:
+            def meth(self): ...
+            def other(self): ...
+
+        class MissingMethod:
+            def meth(self): ...
+
+        class NoneMethod:
+            meth = None
+            def other(self): ...
+
+        # Short regression example: the diagnostics must agree with
+        # isinstance() for every object shape.
+        cases = [
+            (Match(), [], True),
+            (MissingMethod(), [ProtocolMemberMismatch('other', 'missing')], False),
+            (NoneMethod(), [ProtocolMemberMismatch('meth', 'none_method')], False),
+        ]
+        for instance, expected, is_instance in cases:
+            with self.subTest(klass=type(instance).__name__):
+                self.assertIs(isinstance(instance, P), is_instance)
+                self.assertEqual(explain_protocol_mismatch(P, instance), expected)
+                # The diagnostics are empty iff isinstance() succeeds
+                self.assertEqual(not explain_protocol_mismatch(P, instance),
+                                 is_instance)
+
+        mismatch = explain_protocol_mismatch(P, NoneMethod())[0]
+        self.assertEqual(mismatch.member, 'meth')
+        self.assertEqual(mismatch.kind, 'none_method')
+        self.assertEqual(str(mismatch), "method member 'meth' is None")
+        mismatch = explain_protocol_mismatch(P, MissingMethod())[0]
+        self.assertEqual(str(mismatch), "member 'other' is missing")
+
+    def test_explain_protocol_mismatch_no_side_effects(self):
+        @runtime_checkable
+        class P(Protocol):
+            attr: int
+            def meth(self): ...
+
+        class RaisingDescriptor:
+            def __get__(self, obj, objtype=None):
+                raise AssertionError("descriptor must not be called")
+
+        class C:
+            attr = RaisingDescriptor()
+            def __getattr__(self, name):
+                raise AssertionError("__getattr__ must not be called")
+
+        # 'attr' is statically present (the descriptor is not invoked),
+        # only the missing 'meth' member is reported.
+        self.assertNotIsInstance(C(), P)
+        self.assertEqual(
+            explain_protocol_mismatch(P, C()),
+            [ProtocolMemberMismatch('meth', 'missing')],
+        )
+
+        class NoneAttr:
+            attr = None
+            def meth(self): ...
+
+        # 'attr' is a non-callable member, so None is acceptable for it.
+        self.assertIsInstance(NoneAttr(), P)
+        self.assertEqual(explain_protocol_mismatch(P, NoneAttr()), [])
+
+    def test_explain_protocol_mismatch_rejects_non_runtime_checkable(self):
+        class P(Protocol):
+            def meth(self): ...
+
+        for not_a_protocol in int, 1:
+            with self.subTest(obj=not_a_protocol):
+                with self.assertRaisesRegex(TypeError, "is not a Protocol"):
+                    explain_protocol_mismatch(not_a_protocol, object())
+
+        with self.assertRaisesRegex(
+            TypeError,
+            "Instance and class checks can only be used "
+            "with @runtime_checkable protocols",
+        ):
+            explain_protocol_mismatch(P, object())
+
+    def test_explain_protocol_mismatch_concrete_subclass(self):
+        @runtime_checkable
+        class P(Protocol):
+            def meth(self): ...
+
+        class Concrete(P):
+            def __init__(self):
+                self.meth = None
+
+        # A genuine subclass relationship short-circuits the structural
+        # check, mirroring isinstance().
+        self.assertIsInstance(Concrete(), P)
+        self.assertEqual(explain_protocol_mismatch(P, Concrete()), [])
 
     def test_protocols_isinstance_py36(self):
         class APoint:

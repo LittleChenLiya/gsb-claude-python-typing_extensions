@@ -1,3 +1,15 @@
+# Unreleased
+
+- Add `typing_extensions.explain_protocol_mismatch()` and
+  `typing_extensions.ProtocolMemberMismatch`: a diagnostic entry point that
+  explains why an object fails an `isinstance()` check against a
+  `@runtime_checkable` protocol. It distinguishes members that are missing
+  entirely from method members that are `None`, uses
+  `inspect.getattr_static()` so that properties, descriptors and
+  `__getattr__` are never triggered, and raises `TypeError` for objects that
+  are not runtime-checkable protocols. `isinstance()` semantics are
+  unchanged.
+
 # Release 4.16.0 (July 2, 2025)
 
 No user-facing changes since 4.16.0rc2.

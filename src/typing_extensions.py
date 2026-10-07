@@ -74,6 +74,7 @@ __all__ = [
     'disjoint_base',
     'Doc',
     'evaluate_forward_ref',
+    'explain_protocol_mismatch',
     'get_overloads',
     'final',
     'Format',
@@ -91,6 +92,7 @@ __all__ = [
     'overload',
     'override',
     'Protocol',
+    'ProtocolMemberMismatch',
     'sentinel',
     'Sentinel',
     'reveal_type',
@@ -958,6 +960,79 @@ else:
 
 # The "runtime" alias exists for backwards compatibility.
 runtime = runtime_checkable
+
+
+class ProtocolMemberMismatch(typing.NamedTuple):
+    """A single reason why an object does not satisfy a runtime-checkable protocol.
+
+    Attributes:
+        member: The name of the protocol member that is not satisfied.
+        kind: ``'missing'`` if the object does not provide the member at all,
+            or ``'none_method'`` if the member is a method member of the
+            protocol but the object provides ``None`` for it.
+    """
+
+    member: str
+    kind: str
+
+    def __str__(self):
+        if self.kind == 'missing':
+            return f"member {self.member!r} is missing"
+        return f"method member {self.member!r} is None"
+
+
+def explain_protocol_mismatch(cls, instance, /):
+    """Explain why ``isinstance(instance, cls)`` fails for a runtime-checkable protocol.
+
+    Return a list of :class:`ProtocolMemberMismatch` diagnostics, one for each
+    protocol member that *instance* does not provide.  A member is reported as
+    ``'missing'`` if the instance does not have it at all, and as
+    ``'none_method'`` if it is a method member of the protocol for which the
+    instance provides ``None``.  The list is empty if and only if
+    ``isinstance(instance, cls)`` is True.
+
+    Members are looked up with :func:`inspect.getattr_static`, so properties,
+    descriptors and ``__getattr__`` are never triggered, mirroring the
+    behaviour of ``isinstance()`` with ``@runtime_checkable`` protocols.
+
+    Raise TypeError if *cls* is not a ``@runtime_checkable`` protocol.
+
+    Example::
+
+        >>> from typing_extensions import Protocol, runtime_checkable
+        >>> @runtime_checkable
+        ... class P(Protocol):
+        ...     def close(self): ...
+        >>> explain_protocol_mismatch(P, object())
+        [ProtocolMemberMismatch(member='close', kind='missing')]
+    """
+    if not (isinstance(cls, type) and getattr(cls, '_is_protocol', False)):
+        raise TypeError(f'{cls!r} is not a Protocol')
+    if not getattr(cls, '_is_runtime_protocol', False):
+        raise TypeError(
+            "Instance and class checks can only be used with"
+            " @runtime_checkable protocols"
+        )
+    # A genuine subclass relationship short-circuits the structural check,
+    # mirroring _ProtocolMeta.__instancecheck__.
+    if abc.ABCMeta.__instancecheck__(cls, instance):
+        return []
+    protocol_attrs = getattr(cls, '__protocol_attrs__', None)
+    if protocol_attrs is None:
+        protocol_attrs = _get_protocol_attrs(cls)
+    non_callable_members = getattr(
+        cls, '__non_callable_proto_members__', frozenset()
+    )
+    mismatches = []
+    for attr in protocol_attrs:
+        try:
+            val = inspect.getattr_static(instance, attr)
+        except AttributeError:
+            mismatches.append(ProtocolMemberMismatch(attr, 'missing'))
+        else:
+            if val is None and attr not in non_callable_members:
+                mismatches.append(ProtocolMemberMismatch(attr, 'none_method'))
+    return mismatches
 
 
 # Our version of runtime-checkable protocols is faster on Python <=3.11
