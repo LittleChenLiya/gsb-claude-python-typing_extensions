@@ -91,6 +91,7 @@ __all__ = [
     'overload',
     'override',
     'Protocol',
+    'ProtocolMemberOrigin',
     'sentinel',
     'Sentinel',
     'reveal_type',
@@ -3935,7 +3936,6 @@ else:
 
 if hasattr(typing, "is_protocol"):
     is_protocol = typing.is_protocol
-    get_protocol_members = typing.get_protocol_members
 else:
     def is_protocol(tp: type, /) -> bool:
         """Return True if the given type is a Protocol.
@@ -3958,25 +3958,130 @@ else:
             and tp is not typing.Protocol
         )
 
-    def get_protocol_members(tp: type, /) -> typing.FrozenSet[str]:
-        """Return the set of members defined in a Protocol.
 
-        Example::
+class ProtocolMemberOrigin(typing.NamedTuple):
+    """Origin information for a single member of a :class:`Protocol`.
 
-            >>> from typing_extensions import Protocol, get_protocol_members
-            >>> class P(Protocol):
-            ...     def a(self) -> str: ...
-            ...     b: int
-            >>> get_protocol_members(P) == frozenset({'a', 'b'})
-            True
+    The ``origin`` attribute is the most-base protocol class on the MRO that
+    declares the member. When several unrelated bases of a diamond-shaped
+    hierarchy declare the same member, the last one in MRO order is reported.
+    It is ``None`` if the member is only provided by a non-protocol base class
+    (such as an allowlisted ``collections.abc`` helper base).
 
-        Raise a TypeError for arguments that are not Protocols.
-        """
-        if not is_protocol(tp):
-            raise TypeError(f'{tp!r} is not a Protocol')
-        if hasattr(tp, '__protocol_attrs__'):
-            return frozenset(tp.__protocol_attrs__)
-        return frozenset(_get_protocol_attrs(tp))
+    The ``overridden`` attribute is ``True`` if a more-derived class on the
+    MRO redeclares the member after its origin.
+
+    The attributes are deliberately looked up from class dictionaries and
+    annotations only: descriptors (such as a ``property``) are never invoked.
+    """
+
+    origin: typing.Optional[type]
+    overridden: bool
+
+
+def _get_protocol_member_origins(
+    tp: type, members: typing.FrozenSet[str], /
+) -> typing.Dict[str, ProtocolMemberOrigin]:
+    """Map each name in *members* to its declaring protocol and override flag.
+
+    The MRO is walked from the most-derived class towards ``object``
+    (skipping ``object``, ``Protocol`` and ``Generic``). The first class on
+    that walk that declares a member is the most-derived declarer; the last
+    declarer encountered is the "origin" -- the base protocol that first
+    introduced the member. A member is "overridden" when it is redeclared by
+    a class more-derived than its origin.
+
+    Only protocol classes can be origins: ordinary helper base classes
+    (for example an allowlisted ``collections.abc`` class) are not treated as
+    protocol declarations. Descriptors are never executed.
+    """
+    bases = []
+    for base in tp.__mro__[:-1]:  # without object
+        if base.__name__ in {'Protocol', 'Generic'}:
+            continue
+        declared = set(base.__dict__)
+        annotations = getattr(base, '__annotations__', None)
+        if isinstance(annotations, collections.abc.Mapping):
+            declared.update(annotations)
+        bases.append((base, declared, is_protocol(base)))
+
+    result: typing.Dict[str, ProtocolMemberOrigin] = {}
+    for attr in members:
+        # Only protocols can declare protocol members.
+        declarers = [
+            base
+            for base, declared, base_is_protocol in bases
+            if base_is_protocol and attr in declared
+        ]
+        # The bases list is MRO order (most-derived first); the last
+        # declarer is therefore the most-base (origin) protocol.
+        origin = declarers[-1] if declarers else None
+        # More than one protocol declares it: a subclass redeclared the
+        # member after the originating base.
+        overridden = len(declarers) > 1
+        result[attr] = ProtocolMemberOrigin(origin, overridden)
+    return result
+
+
+@typing.overload
+def get_protocol_members(
+    tp: type, /, *, with_origins: typing.Literal[False] = False
+) -> typing.FrozenSet[str]: ...
+@typing.overload
+def get_protocol_members(
+    tp: type, /, *, with_origins: typing.Literal[True]
+) -> typing.Dict[str, ProtocolMemberOrigin]: ...
+def get_protocol_members(tp, /, *, with_origins=False):
+    """Return the members defined in a Protocol.
+
+    By default, this returns a frozen set of member names, exactly like
+    :func:`typing.get_protocol_members`::
+
+        >>> from typing_extensions import Protocol, get_protocol_members
+        >>> class P(Protocol):
+        ...     def a(self) -> str: ...
+        ...     b: int
+        >>> get_protocol_members(P) == frozenset({'a', 'b'})
+        True
+
+    Pass ``with_origins=True`` to get, for every member, a
+    :class:`ProtocolMemberOrigin` naming the most-base protocol class that
+    declares the member (its origin) and whether a subclass protocol
+    overrides it. The member set itself is unchanged::
+
+        >>> class P2(P, Protocol):
+        ...     def a(self) -> str: ...
+        >>> origins = get_protocol_members(P2, with_origins=True)
+        >>> sorted(origins)
+        ['a', 'b']
+        >>> origins['a'].origin is P
+        True
+        >>> origins['a'].overridden
+        True
+        >>> origins['b'].origin is P
+        True
+        >>> origins['b'].overridden
+        False
+
+    Diamond inheritance is resolved according to the MRO, and ordinary
+    (non-protocol) helper base classes are never reported as origins.
+    Descriptors such as ``property`` objects are never evaluated.
+
+    Raise a TypeError for arguments that are not Protocols, regardless of
+    whether *with_origins* is set.
+    """
+    if not is_protocol(tp):
+        raise TypeError(f'{tp!r} is not a Protocol')
+    if hasattr(typing, 'get_protocol_members'):
+        members = typing.get_protocol_members(tp)
+    elif hasattr(tp, '__protocol_attrs__'):
+        members = frozenset(tp.__protocol_attrs__)
+    else:
+        members = frozenset(_get_protocol_attrs(tp))
+    if not with_origins:
+        return members
+    return _get_protocol_member_origins(tp, members)
+
 
 
 if hasattr(typing, "Doc"):

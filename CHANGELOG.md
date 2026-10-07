@@ -1,3 +1,15 @@
+# Unreleased
+
+- Add a `with_origins` keyword parameter to `get_protocol_members()`. When
+  enabled, the function returns each protocol member together with the
+  most-base protocol class that declares it and a flag indicating whether a
+  more-derived protocol overrides it. Diamond-shaped hierarchies are resolved
+  using the MRO, ordinary non-protocol helper bases are not reported as
+  origins, and descriptors (such as properties) are never evaluated. The new
+  `ProtocolMemberOrigin` named tuple describes the per-member result. The
+  default behavior (and therefore the existing member-set interface) is
+  unchanged.
+
 # Release 4.16.0 (July 2, 2025)
 
 No user-facing changes since 4.16.0rc2.

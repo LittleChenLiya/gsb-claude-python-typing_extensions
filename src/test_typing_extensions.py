@@ -63,6 +63,7 @@ from typing_extensions import (
     ParamSpecArgs,
     ParamSpecKwargs,
     Protocol,
+    ProtocolMemberOrigin,
     ReadOnly,
     Required,
     Self,
@@ -4076,6 +4077,148 @@ class ProtocolTests(BaseTestCase):
             get_protocol_members(ConcreteInherit)
         with self.assertRaisesRegex(TypeError, "not a Protocol"):
             get_protocol_members(ConcreteInherit())
+
+    def _check_origins_basic(self, proto_mod):
+        Protocol_ = proto_mod.Protocol
+
+        class Base(Protocol_):
+            x: int
+            y: int
+
+            def m(self) -> str: ...
+
+        class Left(Base, Protocol_):
+            x: str  # override the annotation of Base.x
+
+        class Right(Base, Protocol_):
+            pass
+
+        class Diamond(Left, Right, Protocol_):
+            def m(self) -> str:
+                return "derived"
+
+        members = get_protocol_members(Diamond)
+        self.assertEqual(members, frozenset({'x', 'y', 'm'}))
+
+        origins = get_protocol_members(Diamond, with_origins=True)
+        self.assertIsInstance(origins, dict)
+        self.assertEqual(set(origins), members)
+        for record in origins.values():
+            self.assertIsInstance(record, ProtocolMemberOrigin)
+
+        # The member originates at the most-base protocol that declares it
+        # (diamond resolved according to the MRO), and is marked overridden
+        # when a more-derived protocol redeclares it.
+        self.assertIs(origins['x'].origin, Base)
+        self.assertIs(origins['x'].overridden, True)
+        self.assertIs(origins['y'].origin, Base)
+        self.assertIs(origins['y'].overridden, False)
+        self.assertIs(origins['m'].origin, Base)
+        self.assertIs(origins['m'].overridden, True)
+
+        # On the intermediate protocol, x is overridden but y and m are not.
+        left_origins = get_protocol_members(Left, with_origins=True)
+        self.assertIs(left_origins['x'].origin, Base)
+        self.assertIs(left_origins['x'].overridden, True)
+        self.assertIs(left_origins['y'].overridden, False)
+        self.assertIs(left_origins['m'].overridden, False)
+
+    def test_get_protocol_member_origins(self):
+        self._check_origins_basic(typing_extensions)
+
+    def test_get_protocol_member_origins_typing(self):
+        self._check_origins_basic(typing)
+
+    def test_get_protocol_member_origins_sibling_shadowing(self):
+        # Two unrelated base protocols declaring the same member: neither is
+        # a subclass of the other, so the later one in MRO order is the
+        # reported origin and the member counts as overridden.
+        class L(Protocol):
+            z: int
+
+        class R(Protocol):
+            z: int
+
+        class Joined(L, R, Protocol):
+            pass
+
+        origins = get_protocol_members(Joined, with_origins=True)
+        self.assertIs(origins['z'].origin, R)
+        self.assertIs(origins['z'].overridden, True)
+
+    def test_get_protocol_member_origins_plain_base_not_origin(self):
+        # Iterable is an ordinary (non-protocol) helper base class that is
+        # allowlisted as a protocol base. It must never masquerade as the
+        # origin of a protocol member.
+        class P(collections.abc.Iterable, Protocol):
+            b: int
+
+        members = get_protocol_members(P)
+        self.assertIn('__iter__', members)
+        self.assertIn('b', members)
+
+        origins = get_protocol_members(P, with_origins=True)
+        self.assertIs(origins['b'].origin, P)
+        self.assertIs(origins['b'].overridden, False)
+        # __iter__ comes from the plain ABC only: no protocol origin.
+        self.assertIsNone(origins['__iter__'].origin)
+        self.assertIs(origins['__iter__'].overridden, False)
+
+    def test_get_protocol_member_origins_no_descriptor_evaluation(self):
+        evaluated = []
+
+        class ExplodingDescriptor:
+            def __get__(self, obj, objtype=None):
+                evaluated.append(True)
+                raise RuntimeError("descriptor must not be evaluated")
+
+        class P(Protocol):
+            boom = ExplodingDescriptor()
+
+            @property
+            def q(self) -> int:
+                evaluated.append(True)
+                raise RuntimeError("property fget must not be evaluated")
+
+        class Sub(P, Protocol):
+            boom = ExplodingDescriptor()
+
+        # Neither the member set nor the origin view may invoke descriptors.
+        self.assertEqual(get_protocol_members(P), {'boom', 'q'})
+        origins = get_protocol_members(P, with_origins=True)
+        sub_origins = get_protocol_members(Sub, with_origins=True)
+        self.assertEqual(evaluated, [])
+        self.assertIs(origins['boom'].origin, P)
+        self.assertIs(origins['boom'].overridden, False)
+        self.assertIs(origins['q'].origin, P)
+        self.assertIs(origins['q'].overridden, False)
+        self.assertIs(sub_origins['boom'].origin, P)
+        self.assertIs(sub_origins['boom'].overridden, True)
+        self.assertIs(sub_origins['q'].origin, P)
+        self.assertIs(sub_origins['q'].overridden, False)
+
+    def test_get_protocol_members_with_origins_errors_and_default(self):
+        # The flag is keyword-only.
+        with self.assertRaises(TypeError):
+            get_protocol_members(Protocol, True)
+
+        # Non-protocols are rejected with the flag enabled as well.
+        class Concrete:
+            a: int
+
+        for bad in (object, object(), Protocol, Generic, Concrete, Concrete()):
+            with self.assertRaisesRegex(TypeError, "not a Protocol"):
+                get_protocol_members(bad, with_origins=True)
+
+        # With the option off (default), the original interface is preserved.
+        class P(Protocol):
+            a: int
+
+        self.assertIsInstance(get_protocol_members(P), frozenset)
+        self.assertEqual(
+            get_protocol_members(P),
+            get_protocol_members(P, with_origins=False),
+        )
 
     def test_is_protocol(self):
         self.assertTrue(is_protocol(Proto))

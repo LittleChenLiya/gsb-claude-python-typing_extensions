@@ -1093,7 +1093,7 @@ Functions
 
    .. versionadded:: 4.2.0
 
-.. function:: get_protocol_members(tp)
+.. function:: get_protocol_members(tp, *, with_origins=False)
 
    See :py:func:`typing.get_protocol_members`. In ``typing`` since 3.13.
 
@@ -1109,9 +1109,44 @@ Functions
       >>> get_protocol_members(P)
       frozenset({'a', 'b'})
 
+   Pass ``with_origins=True`` to receive a mapping of every member name to a
+   :class:`ProtocolMemberOrigin` record. Its ``origin`` is the most-base protocol
+   that declares the member (``None`` if it is only inherited from an ordinary
+   non-protocol base class), and ``overridden`` tells whether a more-derived
+   protocol redeclares it. Diamond-shaped hierarchies are resolved using the
+   MRO, and descriptors such as ``property`` objects are never evaluated.
+
+   ::
+
+      >>> class P2(P, Protocol):
+      ...     def a(self) -> str: ...
+      >>> origins = get_protocol_members(P2, with_origins=True)
+      >>> origins['a'] == (P, True)
+      True
+      >>> origins['b'] == (P, False)
+      True
+
    Raise :py:exc:`TypeError` for arguments that are not Protocols.
 
    .. versionadded:: 4.7.0
+
+   .. versionchanged:: 4.16.1
+
+      Added the ``with_origins`` keyword parameter.
+
+.. class:: ProtocolMemberOrigin(origin, overridden)
+
+   Origin information for a protocol member returned by
+   :func:`get_protocol_members` when called with ``with_origins=True``.
+
+   * ``origin``: the most-base protocol class on the MRO that declares the
+     member, or ``None`` if the member is only provided by an ordinary
+     non-protocol helper base class.
+   * ``overridden``: ``True`` if a more-derived protocol class on the MRO
+     redeclares the member after its origin.
+
+   .. versionadded:: 4.16.1
+
 
 .. function:: get_type_hints(obj, globalns=None, localns=None, include_extras=False)
 
